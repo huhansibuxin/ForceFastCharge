@@ -80,6 +80,7 @@
 			<key>cell</key><string>PSGroupCell</string>
 			<key>label</key><string>运行状态</string>
 			<key>footerText</key><string>「powerd 已加载」= 强制充电核心有没有注入成功；「是否在干活」= 本轮有没有真的把系统关掉的充电打开（红点判据）；「SMC 纠正次数」累计增长就代表确实在纠正停充。
+「SMC 实时（开关 / 温控）」直接读电池管理固件：前两个数是充电开关 CH0C / 外部供电开关 CH0I（都是 0 = 系统没在关充电；出现 1 = 系统用禁止位停充，这是本插件能写回去解除的）；后三个数是温控计数（正常时应为 0/0/0，系统因温度限充时会变化）。
 「圆点当前状态」是此刻圆点应该显示的样子，不必盯着状态栏核对。若显示未加载，SSH 查 /var/mobile/Documents/ForceFastCharge/boot.log 与 sb.log。</string>
 		</dict>
 		<dict>
@@ -99,6 +100,12 @@
 			<key>defaults</key><string>com.chargecontrol.ffstatus</string>
 			<key>key</key><string>smcfix</string>
 			<key>label</key><string>SMC 纠正次数</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSValueCell</string>
+			<key>defaults</key><string>com.chargecontrol.ffstatus</string>
+			<key>key</key><string>smcnow</string>
+			<key>label</key><string>SMC 实时（开关 / 温控）</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSValueCell</string>
