@@ -285,6 +285,13 @@ enum {
 
 static io_connect_t gSMCConn   = 0;
 static int32_t      gSMCErr    = 0;   // 最近一次 SMC 调用的 IOReturn（0=成功），诊断/上报用
+// ⭐ v0.5.1：SMC **固件层**返回码（out.param.result），与 io 层 IOReturn 分开上报。
+//   分水岭判读（这是「我们写不进去」和「写进去了被 SMC 拒」的区分依据）：
+//     io 返回 0xe00002bc(=kIOReturnError) 且 smcResult!=0 ⇒ **io 通道通、SMC 固件拒绝**
+//        —— 说明我们的 ABI/权限都没问题，问题在这条命令本身
+//     io 返回 0xe00002c1 之类                                      ⇒ io 层就拒了（权限/ABI）
+//   result 常见值：0x00=接受；0x83=key not found；0x84/0x85=参数/命令被拒。
+static int          gSMCLastResult = 0;
 static volatile BOOL gSMCSelfOpen = NO;  // 标记「这次 IOServiceOpen 是我们自己发的」
 
 // ⚠️ 本层只由 2s tick 单线程调用（见 smcEnforceIfNeeded 的调用点），
@@ -314,28 +321,58 @@ static IOReturn ff_smc_call(int index, FF_SMCParamStruct *in, FF_SMCParamStruct 
     return r;
 }
 
+// ⭐⭐ v0.5.1 根因修复（实机踩坑）：ReadKey / WriteKey 的 input 里**必须回填 keyInfo**。
+//
+//   v0.4.0/v0.5.0 的写法是「用独立的空结构体发 ReadKey/WriteKey」——
+//   结构体里 keyInfo 全零。实机后果（日志铁证）：
+//     · 4 字节键（CHCE / CHBI / CHKS）**读出来恒为 0**（真值分别是 1 / 882mA / 95）
+//     · 所有**写**都被 SMC 固件拒绝（out.param.result != 0）⇒ 写自检「不可写」
+//     · 1 字节键（CH0C / CH0B）看起来"对"，纯属真值本来就是 0 的巧合
+//   上游 SBCPUChargeSMC / Battman libsmc 的正确做法是：
+//       smc_get_keyinfo(key, &in.param.keyInfo);   // ← 结果直接写回 input
+//       in.param.data8 = kSMCReadKey;
+//       smc_call(kSMCHandleYPCEvent, &in, &out);
+//   即 **同一个结构体**先做 GetKeyInfo、再改成 ReadKey/WriteKey 发出去，keyInfo 全程带着。
+//   本版逐字对齐上游。不回填不是"能跑但慢"，是**通道根本没工作**。
+//
 // 读一个 SMC 键。buf 由调用方提供，size 传入容量、返回实际长度。
 static IOReturn ff_smc_read(uint32_t key, void *buf, int32_t *size) {
     if (!size || *size <= 0 || !buf) return kIOReturnBadArgument;
 
-    FF_SMCParamStruct q = {0}, qo = {0};
-    q.key = key;
-    q.param.data8 = kFFSMCGetKeyInfo;
-    IOReturn r = ff_smc_call(kFFSMCHandleYPCEvent, &q, &qo);
-    if (r != kIOReturnSuccess) return r;
-
-    uint32_t dataSize = qo.param.keyInfo.dataSize;
-    if (dataSize == 0 || dataSize > sizeof(qo.param.bytes)) return kIOReturnBadArgument;
-    if ((uint32_t)*size < dataSize) { *size = (int32_t)dataSize; return kIOReturnNoSpace; }
-
     FF_SMCParamStruct in = {0}, out = {0};
     in.key = key;
-    in.param.data8 = kFFSMCReadKey;
+    in.param.data8 = kFFSMCGetKeyInfo;
+    IOReturn r = ff_smc_call(kFFSMCHandleYPCEvent, &in, &out);
+    if (r != kIOReturnSuccess) return r;
+    if (out.param.result != 0) {           // SMC 固件层拒绝了 GetKeyInfo
+        gSMCLastResult = out.param.result;
+        gSMCErr = kIOReturnError;
+        return kIOReturnError;
+    }
+
+    uint32_t dataSize = out.param.keyInfo.dataSize;
+    if (dataSize == 0 || dataSize > sizeof(out.param.bytes)) {
+        gSMCLastResult = 0xFF;             // keyInfo 为空 = 这个键不存在/不可读
+        gSMCErr = kIOReturnError;
+        return kIOReturnError;
+    }
+    if ((uint32_t)*size < dataSize) { *size = (int32_t)dataSize; return kIOReturnNoSpace; }
+
+    // ⭐ 回填 keyInfo，再发 ReadKey（与上游一致 —— 这一步漏了整条通道就是死的）
+    in.param.keyInfo = out.param.keyInfo;
+    in.param.data8   = kFFSMCReadKey;
+    memset(&out, 0, sizeof(out));
     r = ff_smc_call(kFFSMCHandleYPCEvent, &in, &out);
     if (r != kIOReturnSuccess) return r;
+    if (out.param.result != 0) {
+        gSMCLastResult = out.param.result;
+        gSMCErr = kIOReturnError;
+        return kIOReturnError;
+    }
 
     memcpy(buf, out.param.bytes, dataSize);
     *size = (int32_t)dataSize;
+    gSMCLastResult = 0;
     return kIOReturnSuccess;
 }
 
@@ -345,24 +382,41 @@ static IOReturn ff_smc_read(uint32_t key, void *buf, int32_t *size) {
 static IOReturn ff_smc_write(uint32_t key, const void *buf, uint32_t size) {
     if (!buf || size == 0 || size > 120) return kIOReturnBadArgument;
 
-    FF_SMCParamStruct q = {0}, qo = {0};
-    q.key = key;
-    q.param.data8 = kFFSMCGetKeyInfo;
-    IOReturn r = ff_smc_call(kFFSMCHandleYPCEvent, &q, &qo);
-    if (r != kIOReturnSuccess) return r;
-
-    uint32_t dataSize = qo.param.keyInfo.dataSize;
-    if (dataSize == 0 || dataSize > sizeof(qo.param.bytes) || dataSize > size) {
-        return kIOReturnBadArgument;
-    }
-
     FF_SMCParamStruct in = {0}, out = {0};
     in.key = key;
-    in.param.data8 = kFFSMCWriteKey;
+    in.param.data8 = kFFSMCGetKeyInfo;
+    IOReturn r = ff_smc_call(kFFSMCHandleYPCEvent, &in, &out);
+    if (r != kIOReturnSuccess) return r;
+    if (out.param.result != 0) {
+        gSMCLastResult = out.param.result;
+        gSMCErr = kIOReturnError;
+        return kIOReturnError;
+    }
+
+    uint32_t dataSize = out.param.keyInfo.dataSize;
+    if (dataSize == 0 || dataSize > sizeof(in.param.bytes) || dataSize > size) {
+        gSMCLastResult = 0xFF;
+        gSMCErr = kIOReturnError;
+        return kIOReturnError;
+    }
+
+    // ⭐ v0.5.1：与 ff_smc_read 同理 —— keyInfo 必须回填进 input，
+    //   否则 SMC 固件直接拒绝写入（这正是 v0.4/v0.5 「写通道自检=不可写」的根因）。
+    //   注意赋值顺序：keyInfo 在 bytes 之前，先回填再 memcpy 数据互不覆盖。
+    in.param.keyInfo = out.param.keyInfo;
+    in.param.data8   = kFFSMCWriteKey;
     memcpy(in.param.bytes, buf, dataSize);
+
+    memset(&out, 0, sizeof(out));
     r = ff_smc_call(kFFSMCHandleYPCEvent, &in, &out);
     if (r != kIOReturnSuccess) return r;
-    if (out.param.result != 0) { gSMCErr = kIOReturnError; return kIOReturnError; }
+    // io 返回成功 ≠ 写入成功：SMC 固件还可能拒绝，result==0 才是 SMC 级成功
+    if (out.param.result != 0) {
+        gSMCLastResult = out.param.result;
+        gSMCErr = kIOReturnError;
+        return kIOReturnError;
+    }
+    gSMCLastResult = 0;
     return kIOReturnSuccess;
 }
 
@@ -413,6 +467,10 @@ static int  gSMCTotalFix = 0;    // 历史累计
 static BOOL gSMCRecovered = NO;  // 本会话是否靠 SMC 真的把充电救回来过（圆点红/绿判据）
 static int  gSMCFailStreak = 0;  // 连续失败次数（>=3 时降频重试，别刷 SMC）
 static uint64_t gLastSMCWriteNS = 0;
+// v0.5.1：SMC **读** 节流。smcEnforceIfNeeded 现在挂在 2s tick 上，而 SMC 读是
+//   系统调用（IOConnectCallStructMethod × 2/键），没必要每 2s 做一次。
+//   10s 足够及时察觉状态变化，同时把开销压在可忽略的量级。
+static uint64_t gLastSMCReadNS  = 0;
 
 // 电池温度上限（℃）：超过它就不再纠正 —— 宁可充不动，也不绕过原厂热保护。
 // 本机实测「系统停充」发生在 42.5~43.5℃，留 ~2℃ 余量。
@@ -474,9 +532,11 @@ static void writeStatusFile(void) {
         @"smcfix"  : [NSString stringWithFormat:@"%d", gSMCTotalFix],
         // v0.5.0：SMC 实时开关 + 温控值（设置页一行看全，不必 SSH）
         //   开关 CH0C/CH0I 都是 0 = 系统没在"关充电"；任一是 1 = 系统用禁止位停充（我们能解除）
-        @"smcnow"  : [NSString stringWithFormat:@"开关 %d/%d · 温控 %d/%d/%d",
+        // v0.5.1：追加 SMC 固件返回码 —— 非 00 表示上面这对读数本身无效（通道没通）
+        @"smcnow"  : [NSString stringWithFormat:@"开关 %d/%d · 温控 %d/%d/%d · 返回码 %02X",
                       gSMCLastCH0C, gSMCLastCH0I,
-                      gSMCLastCHTE, gSMCLastCHTC, gSMCLastCHTM],
+                      gSMCLastCHTE, gSMCLastCHTC, gSMCLastCHTM,
+                      (unsigned)(gSMCLastResult & 0xFF)],
         // 「强制充电工作中」的判据（v0.4.0 起为两者之一）：
         //   · gSMCRecovered —— 我们通过 SMC 把被系统关掉的充电真的打开了（主要路径）
         //   · gSessionBlocked > 0 —— 拦下了系统的停充写（历史路径，本机实测为空转）
@@ -513,6 +573,10 @@ static void writeStatusFile(void) {
         @"smcCHTM"           : @(gSMCLastCHTM),
         @"smcSelfTested"     : @(gSMCSelfTested),
         @"smcErr"            : @(gSMCErr),
+        // v0.5.1：SMC 固件层返回码（0=接受）。与 smcErr 的区别：
+        //   smcErr=0xe00002bc 且这里非 0 → io 通道通、SMC 固件拒绝（命令本身有问题）
+        //   smcErr 是别的值               → io 层就拒了（权限/ABI）
+        @"smcResult"         : @(gSMCLastResult),
         @"smcFailStreak"     : @(gSMCFailStreak),
         @"smcTempLimitC"     : @(FF_SMC_TEMP_LIMIT_C),
         @"pid"               : @((int)getpid()),
@@ -568,9 +632,10 @@ static void pollChargeState(void) {
             //   ncr=0 正常 / 128 未接充电器 / 其余 = 被限（温度、电量、策略…）。
             //   smcCH0C = 1 且 smcFix = 0 → 系统的确关掉了充电开关，但我们没能写回去；
             //   smcCH0C = 0 且未充电     → 停充在 SMC 更底层，用户态无解。
-            logDiag(@"charge stop reason: %@ sessionBlocked=%d smcFix=%d smcCH0C=%d smcErr=0x%08x",
+            logDiag(@"charge stop reason: %@ sessionBlocked=%d smcFix=%d smcCH0C=%d smcCH0I=%d "
+                    @"smcErr=0x%08x smcResult=0x%02x",
                     ffTelemetryLine(t), gSessionBlocked, gSMCSessFix, gSMCLastCH0C,
-                    (unsigned)gSMCErr);
+                    gSMCLastCH0I, (unsigned)gSMCErr, (unsigned)gSMCLastResult);
         }
         writeStatusFile();
         notify_post(FFChargeStateNotifName.UTF8String);
@@ -608,21 +673,18 @@ static void smcEnforceIfNeeded(void) {
     double tempC    = [t[@"Temperature"] doubleValue] / 100.0;   // IOKit 给的是 1/100 ℃
     int    ncr      = [t[@"NotChargingReason"] intValue];
 
-    // 没插电 / 本来就在正常充 → 无事可做，绝不打扰系统
-    if (!ext || charging) return;
+    // ⭐ v0.5.1：入口条件从「有线 **且** 未充电」放宽为「有线」。
+    //   起因（功能盲区）：系统因温度限流时**往往只把电流压到 0，而 IsCharging 仍报 YES**。
+    //   旧条件会让本函数直接 return ⇒ 永远不去读 SMC ⇒ 「系统关掉了充电开关」这件事
+    //   既发现不了、也纠正不了。现在改为"读一次现场，由**禁止位**决定要不要动手"：
+    //     CH0C/CH0I bit0 有 1  → 纠正（无论 IsCharging 报什么、无论充没充电）
+    //     两位都是 0 且在充电 → 早退，不打扰
+    if (!ext) return;
 
-    // 温度护栏（本插件自加，上游没有）：超上限就不纠正，宁可充不动，
-    // 也不在这一层绕过原厂热保护。理由见 README「风险」一节。
-    if (tempC >= FF_SMC_TEMP_LIMIT_C) {
-        static uint64_t lastWarn = 0;
-        uint64_t n = (uint64_t)dispatch_time(DISPATCH_TIME_NOW, 0);
-        if (n - lastWarn > (uint64_t)(60.0 * NSEC_PER_SEC)) {
-            lastWarn = n;
-            logDiag(@"smc: SKIP 温度 %.1fC >= %.0fC 上限 —— 不绕过原厂热保护 ncr=%d",
-                    tempC, FF_SMC_TEMP_LIMIT_C, ncr);
-        }
-        return;
-    }
+    // 读节流 10s（本函数挂在 2s tick 上，SMC 读没必要这么频繁）
+    uint64_t nowRead = (uint64_t)dispatch_time(DISPATCH_TIME_NOW, 0);
+    if (nowRead - gLastSMCReadNS < (uint64_t)(10.0 * NSEC_PER_SEC)) return;
+    gLastSMCReadNS = nowRead;
 
     // 读 SMC 现场（CHCE / CH0R / CH0B 只作诊断，不参与判断 —— 见上文①）
     // ⚠️ v0.5.0：统一 4 字节读取。v0.4.0 写死 1 字节导致 CH0I/CHCE 恒读失败
@@ -640,8 +702,9 @@ static void smcEnforceIfNeeded(void) {
 
     if (rC != kIOReturnSuccess) {
         gSMCFailStreak++;
-        logThrottled(@"smc: read CH0C failed io=0x%08x smcErr=0x%08x（AppleSMC 权限不足？）streak=%d",
-                     (unsigned)rC, (unsigned)gSMCErr, gSMCFailStreak);
+        logThrottled(@"smc: read CH0C failed io=0x%08x smcResult=0x%02x smcErr=0x%08x "
+                     @"（io 通但 SMC 拒 → 命令/权限；io 就拒 → 无 SMC 权限）streak=%d",
+                     (unsigned)rC, (unsigned)gSMCLastResult, (unsigned)gSMCErr, gSMCFailStreak);
         return;
     }
     gSMCLastCH0C = (int)ch0c;
@@ -661,9 +724,27 @@ static void smcEnforceIfNeeded(void) {
     //   这条分支的存在，正是为了把「我们没工作」与「我们做了但没用」分开。
     if (!needC && !needI) {
         gSMCFailStreak = 0;
+        // 正在正常充电且禁止位都是 0 ⇒ 系统自己干得好好的，绝不插手（也不刷日志）
+        if (charging) return;
         logThrottled(@"smc: CH0C=0x%02x CH0I=0x%02x 均为允许，但未充电 → 停充不在这一层 "
-                     @"ncr=%d temp=%.1fC CH0R=0x%08x CH0B=0x%02x",
-                     ch0c, ch0i, ncr, tempC, ch0r, ch0b);
+                     @"ncr=%d temp=%.1fC CHCE=%u CH0R=0x%08x CH0B=0x%02x",
+                     ch0c, ch0i, ncr, tempC, chce, ch0r, ch0b);
+        return;
+    }
+
+    // 温度护栏（本插件自加，上游没有）：确认**需要纠正**之后才检查 ——
+    //   超上限就不写，宁可充不动，也不在这一层绕过原厂热保护。理由见 README「风险」。
+    //   v0.5.1 把它从函数入口挪到这里：入口放宽后，正常充电也会走到这片代码，
+    //   若仍放在入口，正常充电 + 天热时会每 60s 刷一条无意义的 SKIP 日志。
+    if (tempC >= FF_SMC_TEMP_LIMIT_C) {
+        static uint64_t lastWarn = 0;
+        uint64_t nw = (uint64_t)dispatch_time(DISPATCH_TIME_NOW, 0);
+        if (nw - lastWarn > (uint64_t)(60.0 * NSEC_PER_SEC)) {
+            lastWarn = nw;
+            logDiag(@"smc: SKIP 温度 %.1fC >= %.0fC 上限 —— 不绕过原厂热保护 "
+                    @"CH0C=%u CH0I=%u ncr=%d",
+                    tempC, FF_SMC_TEMP_LIMIT_C, ch0c, ch0i, ncr);
+        }
         return;
     }
 
@@ -679,9 +760,12 @@ static void smcEnforceIfNeeded(void) {
     if (needC) {
         // v0.5.0：改用 ff_smc_write_zero（4 字节零缓冲，内部按真实 dataSize 截取），
         // 不再写死 1 字节 —— 否则 CH0I 这类 4 字节键永远写不进去。
+        gSMCLastResult = 0;
         IOReturn w = ff_smc_write_zero(FF_KEY4('C','H','0','C'));
+        int wRes = gSMCLastResult;
         if (w != kIOReturnSuccess) {
-            logDiag(@"smc: 写 CH0C=0 失败 io=0x%08x smcErr=0x%08x", (unsigned)w, (unsigned)gSMCErr);
+            logDiag(@"smc: 写 CH0C=0 失败 io=0x%08x smcResult=0x%02x smcErr=0x%08x",
+                    (unsigned)w, (unsigned)wRes, (unsigned)gSMCErr);
         } else {
             uint32_t back = 0xFFFFFFFFu;
             IOReturn rb = ff_smc_read_u32(FF_KEY4('C','H','0','C'), &back);
@@ -695,9 +779,12 @@ static void smcEnforceIfNeeded(void) {
     }
 
     if (needI) {
+        gSMCLastResult = 0;
         IOReturn w = ff_smc_write_zero(FF_KEY4('C','H','0','I'));
+        int wRes = gSMCLastResult;
         if (w != kIOReturnSuccess) {
-            logDiag(@"smc: 写 CH0I=0 失败 io=0x%08x smcErr=0x%08x", (unsigned)w, (unsigned)gSMCErr);
+            logDiag(@"smc: 写 CH0I=0 失败 io=0x%08x smcResult=0x%02x smcErr=0x%08x",
+                    (unsigned)w, (unsigned)wRes, (unsigned)gSMCErr);
         } else {
             uint32_t back = 0xFFFFFFFFu;
             IOReturn rb = ff_smc_read_u32(FF_KEY4('C','H','0','I'), &back);
@@ -755,8 +842,9 @@ static void smcProbeTick(void) {
     ff_smc_read_u32(FF_KEY4('C','H','K','S'), &chks);
 
     if (rC != kIOReturnSuccess) {
-        logDiag(@"smc probe: **读失败** CH0C io=0x%08x smcErr=0x%08x —— AppleSMC 通道不可用（权限/ABI）",
-                (unsigned)rC, (unsigned)gSMCErr);
+        logDiag(@"smc probe: **读失败** CH0C io=0x%08x smcResult=0x%02x smcErr=0x%08x "
+                @"—— AppleSMC 通道不可用（权限/ABI/SMC 拒绝）",
+                (unsigned)rC, (unsigned)gSMCLastResult, (unsigned)gSMCErr);
         return;
     }
     gSMCLastCH0C = (int)ch0c;
@@ -767,15 +855,19 @@ static void smcProbeTick(void) {
     gSMCLastCHTE = (int)chte;  gSMCLastCHTC = (int)chtc;  gSMCLastCHTM = (int)chtm;
 
     // 写通道自检：只做一次；严格限制在"禁止位本来就是 0"（写 0 == 写当前值）。
+    // v0.5.1：额外抓写那一刻的 SMC 固件返回码 —— 它是区分
+    //   「io 层拒绝」与「io 通但 SMC 固件拒绝」的唯一依据。
     if (!gSMCSelfTested) {
         gSMCSelfTested = YES;
         if ((ch0c & 1) == 0) {
+            gSMCLastResult = 0;
             IOReturn w = ff_smc_write_zero(FF_KEY4('C','H','0','C'));
+            int wRes = gSMCLastResult;                 // 写自己的 result（别被后面的回读刷掉）
             uint32_t back = 0xFFFFFFFFu;
             IOReturn rb = ff_smc_read_u32(FF_KEY4('C','H','0','C'), &back);
             BOOL writable = (w == kIOReturnSuccess && rb == kIOReturnSuccess && (back & 1) == 0);
-            logDiag(@"smc probe: 写通道自检 CH0C(写0) io=0x%08x → 回读 0x%08x (io=0x%08x) = %@",
-                    (unsigned)w, (unsigned)back, (unsigned)rb,
+            logDiag(@"smc probe: 写通道自检 CH0C(写0) io=0x%08x smcResult=0x%02x → 回读 0x%08x (io=0x%08x) = %@",
+                    (unsigned)w, (unsigned)wRes, (unsigned)back, (unsigned)rb,
                     writable ? @"**可写**" : @"不可写");
         }
     }
@@ -783,10 +875,23 @@ static void smcProbeTick(void) {
     // 现场一行。判读：
     //   CH0C=0 CH0I=0 且 CHBI=0 ⇒ 开关都开着却没电流 = 限流在 SMC 更底层（温度/VBUS 策略）
     //   CH0C=1 或 CH0I=1        ⇒ 系统用「禁止位」停充 —— 这是我们能写回去解除的
+    //   smcResult=0x00          ⇒ 上面这行读数是可信的；非 0 说明读数本身无效
     logDiag(@"smc probe: CH0C=%u CH0I=%u CH0B=%u CHCE=%u CH0R=0x%08x | 温控 CHTE=%u CHTC=%u CHTM=%u "
-            @"| CHBI=%umA CHKS=%u | charging=%d %@",
+            @"| CHBI=%umA CHKS=%u | smcResult=0x%02x | charging=%d %@",
             ch0c, ch0i, ch0b, chce, (unsigned)ch0r, chte, chtc, chtm,
-            chbi, chks, [t[@"IsCharging"] boolValue], ffTelemetryLine(t));
+            chbi, chks, (unsigned)gSMCLastResult,
+            [t[@"IsCharging"] boolValue], ffTelemetryLine(t));
+
+    // v0.5.1：逐个键上报 io 返回码 —— 上面那行若出现"疑似全零"的读数
+    //   （如 CHCE=0 但明明插着线、CHBI=0 但明明在充电），看这行就知道是哪个键读失败。
+    //   ⭐ 全部 0x00000000 且读数合理 ⇒ SMC 通道完全正常。
+    if (rC != kIOReturnSuccess || rI != kIOReturnSuccess || rE != kIOReturnSuccess ||
+        rR != kIOReturnSuccess || rB != kIOReturnSuccess) {
+        logDiag(@"smc probe: 部分键读失败 — per-key io CH0C=0x%08x CH0I=0x%08x CHCE=0x%08x "
+                @"CH0R=0x%08x CH0B=0x%08x smcResult=0x%02x（0x00=全部正常）",
+                (unsigned)rC, (unsigned)rI, (unsigned)rE, (unsigned)rR, (unsigned)rB,
+                (unsigned)gSMCLastResult);
+    }
 }
 
 // ---------------------------------------------------------------- 属性分类
@@ -1188,14 +1293,14 @@ static void heartbeatTick(void) {
     //   「系统的充电开关现在开还是关」「我们救回来过几次」「SMC 通道通不通」。
     logDiag(@"heartbeat %@ pid=%d hooks=%d force=%d %@ sessionBlocked=%d blocked=%d setterCalls=%d "
             @"smc[CH0C=%d CH0I=%d CH0B=%d CHCE=%d CH0R=%d 温控 tE=%d tC=%d tM=%d "
-            @"fix=%d/%d err=0x%08x streak=%d rec=%d selftest=%d]",
+            @"fix=%d/%d err=0x%08x res=0x%02x streak=%d rec=%d selftest=%d]",
             gLastCharging ? @"charging" : @"idle",
             (int)getpid(), gHookInstalled, gForceFastCharge,
             ffTelemetryLine(readBatteryTelemetry()),
             gSessionBlocked, gBlockedCount, gSetterCalls,
             gSMCLastCH0C, gSMCLastCH0I, gSMCLastCH0B, gSMCLastCHCE, gSMCLastCH0R,
             gSMCLastCHTE, gSMCLastCHTC, gSMCLastCHTM,
-            gSMCSessFix, gSMCTotalFix, (unsigned)gSMCErr, gSMCFailStreak,
+            gSMCSessFix, gSMCTotalFix, (unsigned)gSMCErr, (unsigned)gSMCLastResult, gSMCFailStreak,
             (int)gSMCRecovered, (int)gSMCSelfTested);
 }
 

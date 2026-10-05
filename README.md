@@ -16,11 +16,19 @@
 > 同时修正圆点判据：由 `IsCharging` 改为 `ExternalConnected`（插着线就显示），
 > 并新增**橙点**表示「有线但系统没在充」。详见下文。
 >
-> ⭐ **v0.5.0（当前）**：修一个**会让 CH0I 恢复分支彻底失效**的宽度 bug
+> ⭐ **v0.5.0**：修一个**会让 CH0I 恢复分支彻底失效**的宽度 bug
 > （SMC 键不是统一 1 字节：`CH0C` 是 1 字节，`CH0I`/`CHCE` 是 4 字节；
 > v0.4.0 写死 1 字节 ⇒ 这两个键每次都读失败）。并把**观测与纠正彻底解耦**：
 > 新增 60s 常驻 `smc probe`（只要有线就读，不管充不充电）+ **写通道自检**，
 > 用于回答「温度高了系统限充，我们到底能不能解除」。详见下文 v0.5.0 一节。
+>
+> ⭐⭐ **v0.5.1（当前）**：**SMC 写通道此前从未通过** —— 写自检报「不可写」、
+> 纠正次数恒为 0。根因不是权限（io 层是通的，powerd 确有 applesmc entitlement），
+> 而是**漏抄了上游一行关键逻辑**：ReadKey/WriteKey 的 input 里必须**回填 keyInfo**
+> （GetKeyInfo 的结果要写回同一个结构体再发出去）。漏了它 ⇒ 4 字节键读数恒为 0、
+> 所有写被 SMC 固件拒绝。本版逐字对齐上游修复，并把 **SMC 固件返回码**与 io 错误
+> 分开上报，同时把纠正入口从「有线且未充电」放宽为「有线」（限流时 `IsCharging`
+> 常仍报 YES，旧条件会让纠正永远不会触发）。详见下文 v0.5.1 一节。
 
 ## 为什么不做「强制快充」了
 
@@ -266,6 +274,66 @@ ssh root@192.168.3.156 'tail -20 /rootfs/private/var/mobile/Documents/ForceFastC
 >
 > ⚠️ 另一个陷阱：**别把"建窗"这类必须重试的动作放在"状态变化"的短路分支后面**。
 > 事件驱动省 CPU 是对的，但"每轮都该做的事"（保活、重试、兜底）必须放在短路之前。
+
+### v0.5.1：SMC 通道**从头到尾就是死的** —— 漏了上游一行关键逻辑（keyInfo 回填）
+
+**起因**：老板问「纠正次数这些都是 0，看看生效了没」。
+
+**答案：一次都没成功过。** 实机日志（`ffcharge.log`）：
+
+```
+smc probe: 写通道自检 CH0C(写0) io=0xe00002bc → 回读 0x00000000 (io=0x00000000) = 不可写
+heartbeat ... smc[CH0C=0 CH0I=0 CH0B=0 CHCE=0 CH0R=0 fix=0/0 err=0xe00002bc ... selftest=1]
+```
+
+写通道自检写的是 CH0C 的**当前值**（0），零副作用、本该必成 —— 它失败了。
+
+**根因：漏了「把 GetKeyInfo 的结果回填进 input 结构体」这一步。**
+
+| 上游 `SBCPUChargeSMC` / Battman libsmc | 本项目 v0.4.0 / v0.5.0 |
+|---|---|
+| `smc_get_keyinfo(key, &in.param.keyInfo)` ← 结果**写回 input** | 用**另一个独立的空结构体**发 ReadKey/WriteKey |
+| ReadKey/WriteKey 的 input 里**带着 keyInfo** | input 的 `keyInfo` **全零** |
+
+后果正好解释日志里两个一直没解释通的怪现象：
+
+1. **4 字节键读出来恒为 0** —— `CHCE` 真值 1（有线）、`CHBI` 真值 ~800mA（在充电），我们读 0。
+   1 字节键（`CH0C`/`CH0B`）"看起来对"纯属**真值本来就是 0** 的巧合。
+2. **所有写被 SMC 固件拒绝** —— `out.param.result != 0`，而我们代码里返回 `0xe00002bc`
+   （`kIOReturnError`）的**唯一路径**就是这一条。
+
+**注意这不是"权限不足"**：io 层是通的（`IOServiceOpen` 成功、读调用返回 `kIOReturnSuccess`），
+所以 **powerd 确实有 `com.apple.private.applesmc.user-access`**（二进制里可以看到这个 entitlement
+和 `AppleSMCClient`；`smcDiagnose` 这个 Apple 自带工具能 dump 全表 1491 键也是同一权限），
+**不需要新增 daemon**。问题纯粹在我们自己的结构体填法。
+
+**修法**：与上游逐字对齐 —— 同一个结构体先做 GetKeyInfo、再改成 ReadKey/WriteKey 发出去，
+`keyInfo` 全程带着。
+
+**同时补三处诊断/增强**（避免再来回折腾）：
+
+- 新增 `gSMCLastResult`：把 **SMC 固件层返回码**（`out.param.result`）与 io 层 `IOReturn`
+  **分开上报** —— 前者非 0 而 `smcErr==0xe00002bc` ⇒ io 通、SMC 拒（命令的问题）；
+  `smcErr` 是别的值 ⇒ io 层就拒了（权限/ABI）。设置页「SMC 实时」与心跳 `smc[...]` 都带它。
+- `smc probe` 增加 **per-key io 返回码**一行：读数若可疑（如插着线却 `CHCE=0`），
+  看这行就知道是哪个键读失败。
+- **入口条件从「有线 且 未充电」放宽为「有线」**（读 10s 节流）：
+  系统限流时常常**只把电流压到 0 而 `IsCharging` 仍报 YES**，旧条件会让函数直接 return，
+  **永远不去读 SMC** —— 那「系统关掉了充电开关」这件事既发现不了也纠正不了。
+  现在由**禁止位**（`CH0C`/`CH0I` bit0）决定要不要动手。
+
+**验证（装上后）**：
+
+```bash
+ssh root@192.168.3.156 'grep -E "smc probe|smc: FIX" /rootfs/private/var/mobile/Documents/ForceFastCharge/ffcharge.log | tail -20'
+```
+
+| 看到 | 结论 |
+|---|---|
+| `写通道自检 ... smcResult=0x00 = **可写**` | ✅ 通道修好了，真限充时就能纠正 |
+| `smc probe: CHCE=1 CHBI=xxx mA` | ✅ 读数可信了（修复前恒为 0） |
+| `写通道自检 ... smcResult=0xXX = 不可写` | ⚠️ 仍被拒，`0xXX` 就是 SMC 给的原因码 |
+| `smc probe: CH0C=0 CH0I=0 ... CHBI=0mA` | ⚠️ 开关都开着却没电流 ⇒ 限流在 SMC 更底层，用户态无解 |
 
 ### v0.5.0：SMC 键的宽度不是统一的 —— 以及「温度限充能不能解除」怎么验
 

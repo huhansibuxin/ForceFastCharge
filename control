@@ -6,4 +6,4 @@ Depends: mobilesubstrate, preferenceloader
 Maintainer: huhansibuxin
 Section: Tweaks
 Architecture: iphoneos-arm
-Version: 0.5.0
+Version: 0.5.1
