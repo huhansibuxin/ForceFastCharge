@@ -1,10 +1,13 @@
 #!/bin/sh
 case "$1" in
 remove|purge)
-# 卸载时清理诊断日志与状态文件
-rm -f /var/mobile/ForceFastCharge/ffcharge.log 2>/dev/null || true
-rm -f /var/mobile/ForceFastCharge/status.plist 2>/dev/null || true
-rmdir /var/mobile/ForceFastCharge 2>/dev/null || true
+# 卸载时清理诊断日志与状态文件（新位置）
+rm -rf /var/mobile/Documents/ForceFastCharge 2>/dev/null || true
+# 旧位置（v0.1.1 及以前）
+rm -rf /var/mobile/ForceFastCharge 2>/dev/null || true
+# jbroot 内的状态域文件
+rm -f /var/mobile/Containers/Shared/AppGroup/.jbroot-*/var/mobile/Library/Preferences/com.chargecontrol.ffstatus.plist 2>/dev/null || true
+rm -f /var/mobile/Containers/Shared/AppGroup/.jbroot-*/var/mobile/Library/Preferences/com.chargecontrol.sbstatus.plist 2>/dev/null || true
 # 重启相关进程，摘除已注入的 tweak（SpringBoard 用 SIGTERM，避免 -9 致下次启动崩溃）
 killall -9 powerd 2>/dev/null || true
 killall -10 SpringBoard 2>/dev/null || true

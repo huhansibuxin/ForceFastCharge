@@ -2,13 +2,15 @@
 case "$1" in
 configure)
 # 清除上一版本诊断日志与状态文件，保证本次测试从干净状态开始
-rm -f /var/mobile/ForceFastCharge/boot.log     2>/dev/null || true
-rm -f /var/mobile/ForceFastCharge/ffcharge.log 2>/dev/null || true
-rm -f /var/mobile/ForceFastCharge/sb.log       2>/dev/null || true
-rm -f /var/mobile/ForceFastCharge/status.plist 2>/dev/null || true
-rm -f /var/mobile/ForceFastCharge/sb_status.plist 2>/dev/null || true
+# 新位置：/var/mobile/Documents/ForceFastCharge（mobile 可写，SpringBoard 也能写）
+rm -rf /var/mobile/Documents/ForceFastCharge 2>/dev/null || true
+# 旧位置残留（v0.1.2 及以前把日志写在 root 拥有的目录里，SB 写不进去）
+rm -rf /var/mobile/ForceFastCharge           2>/dev/null || true
 rm -f /var/tmp/ff_boot.log 2>/dev/null || true
-rm -f /tmp/ff_boot.log 2>/dev/null || true
+rm -f /tmp/ff_boot.log     2>/dev/null || true
+# 清除状态域文件（roothide 下位于 jbroot 的 Preferences 目录，随机串用通配符匹配）
+rm -f /var/mobile/Containers/Shared/AppGroup/.jbroot-*/var/mobile/Library/Preferences/com.chargecontrol.ffstatus.plist 2>/dev/null || true
+rm -f /var/mobile/Containers/Shared/AppGroup/.jbroot-*/var/mobile/Library/Preferences/com.chargecontrol.sbstatus.plist 2>/dev/null || true
 # 重启 powerd，让强制快充核心注入生效
 killall -9 powerd 2>/dev/null || true
 # 重启 SpringBoard 让指示点注入生效。

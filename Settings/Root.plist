@@ -66,7 +66,7 @@
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
 			<key>label</key><string>运行状态</string>
-			<key>footerText</key><string>powerd 行 = 强制快充核心（吞降流）是否生效；指示器行 = 灵动岛圆点是否生效。blockedWrites 持续增长代表确实在拦截降流写。若「指示器已加载=否」，查 /var/mobile/ForceFastCharge/boot.log 与 sb.log。</string>
+			<key>footerText</key><string>powerd 行 = 强制快充核心（吞降流）是否生效；指示器行 = 灵动岛圆点是否生效。「已拦截降流次数」持续增长代表确实在拦截降流写。若显示未加载，SSH 查 /var/mobile/Documents/ForceFastCharge/boot.log 与 sb.log。</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSValueCell</string>
@@ -110,7 +110,7 @@
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
 			<key>label</key><string>效果边界</string>
-			<key>footerText</key><string>充电速度最终由充电器额定功率、线材规格、电池 BMS 与机身温度共同决定。本插件只保证「系统不主动往下压电流上限」，无法突破充电器功率天花板。诊断日志：/var/mobile/ForceFastCharge/（boot.log / ffcharge.log / sb.log，安装或升级时自动清除）。</string>
+			<key>footerText</key><string>充电速度最终由充电器额定功率、线材规格、电池 BMS 与机身温度共同决定。本插件只保证「系统不主动往下压电流上限」，无法突破充电器功率天花板。诊断日志：/var/mobile/Documents/ForceFastCharge/（boot.log / ffcharge.log / sb.log，安装或升级时自动清除）。</string>
 		</dict>
 	</array>
 </dict>

@@ -45,7 +45,7 @@ static BOOL gLastCharging = NO;   // 当前充电状态，供状态文件与指�
 // ---------------------------------------------------------------- 诊断日志
 static NSString *diagLogPath(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *dir = @"/var/mobile/ForceFastCharge";
+    NSString *dir = FFLogDir();          // /var/mobile/Documents/ForceFastCharge
     if (![fm fileExistsAtPath:dir]) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     }
@@ -83,7 +83,10 @@ static void logThrottled(NSString *fmt, ...) {
 // 注意：powerd 以 root 运行，用 CFPreferences 走 mobile 域会串域，
 //      必须像上游 SBCPUChargeEngine 那样直读 plist 文件。
 static BOOL readBoolPref(NSString *key, BOOL fallback) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:FFPrefPath()];
+    // 逐候选路径读（jbroot 版 / 真实版 / var/jb 版）：
+    // roothide 下设置页把开关写进 jbroot，而 powerd 是系统进程读的是真实 rootfs，
+    // 只认单一路径就会「开关打开了这里却是 false」。
+    NSDictionary *d = FFReadPrefsDict();
     if (!d) return fallback;
     id v = d[key];
     if ([v isKindOfClass:[NSNumber class]]) return [v boolValue];
@@ -93,14 +96,39 @@ static BOOL readBoolPref(NSString *key, BOOL fallback) {
     return fallback;
 }
 
-// 状态标志：设置页读取，用来确认 tweak 是否真的装上并生效
+// 状态标志：设置页「运行状态」两行读的是 defaults=com.chargecontrol.ffstatus 域
+// 的 loaded / blocked 键（见 Settings/Root.plist）。
+// ⚠️ v0.1.3 修复：此前这里只写自定义文件 status.plist，与设置页的读取通道
+//    完全对不上 → 设置页永远显示「未加载」。现在写官方域文件（roothide 下位于
+//    jbroot 的 Preferences 目录，正好是设置页读的那份），另存诊断文件供人排查。
+static int  gStatBlocked  = -1;
+static BOOL gStatCharging = NO;
+static BOOL gStatForce    = NO;
+
 static void writeStatusFile(void) {
     if (!gHookInstalled) return;
+    // 节流：2s 定时器会频繁调用本函数，内容没变就不重复写盘（省 IO）
+    if (gStatBlocked == gBlockedCount && gStatCharging == gLastCharging &&
+        gStatForce == gForceFastCharge) {
+        return;
+    }
+    gStatBlocked  = gBlockedCount;
+    gStatCharging = gLastCharging;
+    gStatForce    = gForceFastCharge;
+
     NSString *dir = FFLogDir();
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir                             \
-                             withIntermediateDirectories:YES                                          \
-                                              attributes:nil error:nil];
-    NSString *nowStr = [[NSDate date] description];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+
+    // ① 设置页读的域文件（键名必须与 Root.plist 的 key 逐字一致）
+    NSDictionary *domain = @{
+        @"loaded"  : (gHookInstalled ? @"是" : @"否"),
+        @"blocked" : [NSString stringWithFormat:@"%d", gBlockedCount],
+    };
+    FFWriteDomainPlist(@"ffstatus", domain);
+
+    // ② 诊断文件（字段更全，人肉排查用）
     NSDictionary *st = @{
         @"hookInstalled"     : @(gHookInstalled),
         @"forceEnabled"      : @(gForceFastCharge),
@@ -108,9 +136,9 @@ static void writeStatusFile(void) {
         @"charging"          : @(gLastCharging),
         @"pid"               : @((int)getpid()),
         @"blockedWriteCount" : @(gBlockedCount),
-        @"updatedAt"         : nowStr
+        @"updatedAt"         : [[NSDate date] description]
     };
-    [st writeToFile:FFStatusPath() atomically:YES];
+    [st writeToFile:[dir stringByAppendingPathComponent:@"ff_status.plist"] atomically:YES];
 }
 
 static void updateChargeState(void) {
@@ -135,7 +163,6 @@ static void updateChargeState(void) {
 }
 
 // ---------------------------------------------------------------- 充电状态
-static void writeStatusFile(void);   // 前置声明：pollChargeState 需要用它刷新 charging
 // 读 IOPMPowerSource 的 ExternalConnected/IsCharging；状态变化时 post
 // FFChargeStateNotif，驱动 SpringBoard 侧指示点显示/隐藏。
 static BOOL readIsCharging(void) {
@@ -300,9 +327,11 @@ static void settingsChanged(CFNotificationCenterRef center, void *observer,
         //    避免再出现「CocoaTop 看得到 dylib、却零日志零功能」的黑洞。
         FFBootLog("FF-powerd-ctor");
 
-        // ①' kill-switch：SSH 下 touch /var/mobile/ForceFastCharge/disable 即可让本
-        //      dylib 完全空跑（不挂任何 hook），用于异常时的快速止血。
-        if (access("/var/mobile/ForceFastCharge/disable", F_OK) == 0) {
+        // ①' kill-switch：SSH 下 touch /var/mobile/Documents/ForceFastCharge/disable
+        //      即可让本 dylib 完全空跑（不挂任何 hook），用于异常时的快速止血。
+        //      旧路径 /var/mobile/ForceFastCharge/disable 也一并认，兼容老习惯。
+        if (access("/var/mobile/Documents/ForceFastCharge/disable", F_OK) == 0 ||
+            access("/var/mobile/ForceFastCharge/disable", F_OK) == 0) {
             logDiag(@"kill-switch 命中 → 不挂 hook");
             return;
         }

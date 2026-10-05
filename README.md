@@ -28,12 +28,18 @@
 
 ## 运行状态标志
 
-设置页「运行状态」区实时显示（数据由 powerd 侧写入 `status.plist`）：
+设置页「运行状态」区实时显示（数据由各 dylib 写入 Preferences 域文件，设置页按 `defaults=` 域读取）：
 
-| 字段 | 含义 |
-|---|---|
-| `tweakLoaded` | `YES` = dylib 已注入 powerd 且 hook 装好；若为 `NO` 说明未注入（需确认 powerd 已重启） |
-| `blockedWrites` | 启动至今被拦下的降流写次数，**数值持续增长即代表确实在拦截生效** |
+| 行 | 数据源 | 含义 |
+|---|---|---|
+| powerd 已加载 | `com.chargecontrol.ffstatus` 域 `loaded` | `是` = dylib 已注入 powerd 且 hook 装好；`否` = 未注入或未重启 powerd |
+| 已拦截写次数 | `com.chargecontrol.ffstatus` 域 `blocked` | 启动至今被拦下的降流写次数，**数值持续增长即代表确实在拦截生效** |
+| 指示器已加载 | `com.chargecontrol.sbstatus` 域 `dotLoaded` | `是` = 指示点 target 已注入 SpringBoard |
+| 指示点窗口 | `com.chargecontrol.sbstatus` 域 `dotWindow` | `是` = 指示点 UIWindow 已挂到屏幕 |
+
+> ⚠️ roothide 隐根下设置页读写 `/var/mobile/Library/Preferences/` 会被自动重定向到 jbroot 内的同名路径，
+> 而注入系统进程的 dylib 直读直写真实路径。本插件已内置 jbroot 自定位（`FFJbrootPrefix`，dladdr 反推 + 目录扫描 + `/var/jb` 三级回退），
+> 保证两边落到**同一个文件**——这正是 v0.1.3 修复「设置页永远显示未加载」的关键。
 
 ## 与旧版（ChargeControl 激进派）的区别
 
@@ -64,10 +70,19 @@
 
 ## 诊断日志与状态文件
 
-- 日志：`/var/mobile/ForceFastCharge/ffcharge.log`
-- 状态：`/var/mobile/ForceFastCharge/status.plist`
+所有文件都在 `/var/mobile/Documents/ForceFastCharge/`（mobile 拥有、不被 roothide 重定向，powerd(root) 与 SpringBoard(mobile) 都能写）：
 
-安装/升级时由 `postinst` 自动清除日志，保证每次测试从干净状态开始。
+| 文件 | 写入者 | 内容 |
+|---|---|---|
+| `boot.log` | 两个 dylib 的 `%ctor` 第一行（纯 POSIX，不依赖 ObjC） | 加载痕迹：`path/pid/progname`，用于区分「ctor 没跑」与「写盘被拒」 |
+| `ffcharge.log` | powerd 侧 | hook 安装、每次拦截的降流键 |
+| `ff_status.plist` | powerd 侧 | powerd 侧状态诊断副本 |
+| `sb.log` | SpringBoard 侧 | 指示点创建、刷新、定时器心跳 |
+| `sb_status.plist` | SpringBoard 侧 | 指示点状态诊断副本 |
+
+设置页读的**状态域文件**（`ffstatus`/`sbstatus`）由 dylib 写入 jbroot 内的 `var/mobile/Library/Preferences/`。
+
+安装/升级时由 `postinst` 自动清除日志，保证每次测试从干净状态开始；异常时 `touch /var/mobile/Documents/ForceFastCharge/disable` 可空跑止血。
 
 ## 构建
 

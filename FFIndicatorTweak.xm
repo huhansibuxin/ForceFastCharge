@@ -36,8 +36,12 @@ static BOOL gEnabled      = NO;   // 是否成功进入运行态
 // ---------------------------------------------------------------- 诊断日志
 // SpringBoard 侧此前完全没有日志，出问题只能盲猜，这里补全。
 static void sbLog(NSString *fmt, ...) {
-    mkdir("/var/mobile/ForceFastCharge", 0755);
-    int fd = open("/var/mobile/ForceFastCharge/sb.log",
+    // ⚠️ 必须写 mobile 可写的位置：SpringBoard 以 mobile 身份运行，
+    //    powerd 建的 /var/mobile/ForceFastCharge(root:mobile 755) 它写不进去，
+    //    之前"SB 侧零日志"就是这么来的。Documents 归 mobile 所有且不被 RootHide 重定向。
+    mkdir("/var/mobile/Documents/ForceFastCharge", 0777);
+    chmod("/var/mobile/Documents/ForceFastCharge", 0777);
+    int fd = open("/var/mobile/Documents/ForceFastCharge/sb.log",
                   O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return;
     va_list ap; va_start(ap, fmt);
@@ -123,7 +127,20 @@ static BOOL readCharging(void) {
 
 // ---------------------------------------------------------------- 状态回写
 static void writeSbStatus(CGFloat cx, CGFloat cy) {
-    mkdir("/var/mobile/ForceFastCharge", 0755);
+    NSString *dir = FFLogDir();
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+
+    // ① 设置页读的域文件（键名必须与 Root.plist 的 key 逐字一致：
+    //    defaults=com.chargecontrol.sbstatus，键 dotLoaded / dotWindow）
+    NSDictionary *domain = @{
+        @"dotLoaded" : (gEnabled ? @"是" : @"否"),
+        @"dotWindow" : ([FFIndicator windowCreated] ? @"已创建" : @"未创建"),
+    };
+    FFWriteDomainPlist(@"sbstatus", domain);
+
+    // ② 诊断文件（字段更全）
     NSDictionary *st = @{
         @"loaded"        : @(gEnabled),
         @"windowCreated" : @([FFIndicator windowCreated]),
@@ -136,7 +153,7 @@ static void writeSbStatus(CGFloat cx, CGFloat cy) {
         @"pid"           : @((int)getpid()),
         @"updatedAt"     : [[NSDate date] description]
     };
-    [st writeToFile:[FFLogDir() stringByAppendingPathComponent:@"sb_status.plist"]
+    [st writeToFile:[dir stringByAppendingPathComponent:@"sb_status.plist"]
          atomically:YES];
 }
 
@@ -181,8 +198,10 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
         // ① 先落盘（纯 POSIX），保证只要 dylib 被加载就有痕迹
         FFBootLog("FF-indicator-ctor");
 
-        // ② kill-switch：存在 /var/mobile/ForceFastCharge/disable 则完全空跑
-        if (access("/var/mobile/ForceFastCharge/disable", F_OK) == 0) {
+        // ② kill-switch：存在 .../Documents/ForceFastCharge/disable 则完全空跑
+        //    （旧路径也一并认，兼容老习惯）
+        if (access("/var/mobile/Documents/ForceFastCharge/disable", F_OK) == 0 ||
+            access("/var/mobile/ForceFastCharge/disable", F_OK) == 0) {
             sbLog(@"kill-switch 命中 → 不启动");
             return;
         }

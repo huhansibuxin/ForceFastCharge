@@ -3,6 +3,7 @@
 
 #import <Foundation/Foundation.h>
 #import <notify.h>
+#import <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,37 +48,156 @@ static NSString *const FFChargeStateNotifName = @"com.chargecontrol/chargeStateC
 // Theos 默认 -Werror 会因未使用的 static inline 函数报错，故统一标 unused。
 #define FF_UNUSED __attribute__((unused))
 
-static FF_UNUSED NSString *FFLogDir(void) {
-    return @"/var/mobile/ForceFastCharge";
+// ================================================================ jbroot 定位
+// 【为什么必须做，v0.1.3 核心修复】
+// roothide 隐根下，被 RootHide 处理过的进程（设置 App、SpringBoard）读写
+//   /var/mobile/Library/Preferences/x.plist
+// 会被**自动重定向**到 jbroot 内：
+//   /var/mobile/Containers/Shared/AppGroup/.jbroot-XXXX/var/mobile/Library/Preferences/x.plist
+// 而注入 powerd 的 dylib 跑在系统进程里，直读直写的是**真实 rootfs** 那份。
+// 两边根本不是同一个文件 → 「开关打开了没反应」「设置页永远显示未加载」。
+// 实测铁证（2026-10-05）：
+//   真实 rootfs /var/mobile/Library/Preferences/com.chargecontrol.plist —— 不存在
+//   jbroot    .jbroot-XXXX/var/mobile/Library/Preferences/com.chargecontrol.plist —— 设置页写的在这
+// 所以必须自己算出 jbroot 前缀，让 dylib 与设置页读写同一份文件。
+//
+// 三级回退：① dladdr 从自身镜像物理路径反推 → ② 扫目录找 .jbroot-* → ③ /var/jb
+static FF_UNUSED NSString *FFJbrootPrefix(void) {
+    static NSString *prefix = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        @autoreleasepool {
+            // ① dladdr：被注入的 dylib 物理路径形如
+            //    /private/var/containers/Bundle/Application/.jbroot-XXXX/usr/lib/TweakInject/X.dylib
+            //    掐掉 /usr/lib/TweakInject/ 之前那段就是 jbroot 前缀。
+            @try {
+                Dl_info info;
+                if (dladdr((const void *)&FFJbrootPrefix, &info) && info.dli_fname) {
+                    NSString *p = [NSString stringWithUTF8String:info.dli_fname];
+                    NSArray<NSString *> *marks = @[
+                        @"/usr/lib/TweakInject/",
+                        @"/Library/MobileSubstrate/DynamicLibraries/"
+                    ];
+                    for (NSString *m in marks) {
+                        NSRange r = [p rangeOfString:m];
+                        if (r.location != NSNotFound && r.location > 0) {
+                            NSString *cand = [p substringToIndex:r.location];
+                            if ([cand containsString:@".jbroot-"]) { prefix = cand; break; }
+                        }
+                    }
+                }
+            } @catch (NSException *e) {}
+
+            // ② 目录扫描（系统进程里 dladdr 可能只给逻辑路径，拿不到 .jbroot- 串）
+            if (!prefix.length) {
+                @try {
+                    NSFileManager *fm = [NSFileManager defaultManager];
+                    NSArray<NSString *> *bases = @[
+                        @"/var/containers/Bundle/Application",
+                        @"/var/mobile/Containers/Shared/AppGroup"
+                    ];
+                    for (NSString *base in bases) {
+                        for (NSString *e in [fm contentsOfDirectoryAtPath:base error:nil]) {
+                            if ([e hasPrefix:@".jbroot-"]) {
+                                prefix = [base stringByAppendingPathComponent:e];
+                                break;
+                            }
+                        }
+                        if (prefix.length) break;
+                    }
+                } @catch (NSException *e) {}
+            }
+        }
+        if (!prefix) prefix = @"";
+    });
+    return prefix;
+}
+
+// 把「逻辑路径」映射到当前进程该用的实际路径（有 jbroot 前缀就带上）
+static FF_UNUSED NSString *FFJbrootPath(NSString *absPath) {
+    if (![absPath hasPrefix:@"/"]) return absPath;
+    NSString *jb = FFJbrootPrefix();
+    if (jb.length > 0) return [jb stringByAppendingString:absPath];
+    return absPath;
+}
+
+// ---------------------------------------------------------------- 偏好读写路径
+// 读：把 jbroot 版、真实版、/var/jb 版都试一遍，取第一个存在的
+// （powerd / SpringBoard / 设置页三者所处的"路径域"不完全一致，多试最稳）
+static FF_UNUSED NSArray<NSString *> *FFPrefCandidates(void) {
+    NSString *rel = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", FFPrefDomain];
+    NSMutableArray *a = [NSMutableArray array];
+    NSString *jb = FFJbrootPrefix();
+    if (jb.length) [a addObject:[jb stringByAppendingString:rel]];
+    [a addObject:rel];
+    [a addObject:[@"/var/jb" stringByAppendingString:rel]];
+    return a;
 }
 
 static FF_UNUSED NSString *FFPrefPath(void) {
-    return [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", FFPrefDomain];
+    NSArray<NSString *> *cands = FFPrefCandidates();
+    for (NSString *p in cands) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return p;
+    }
+    return cands.firstObject ?: cands[0];
 }
 
-// 状态标志文件：由 powerd 侧写入，设置页读取并展示「是否真的在生效」
+// 读偏好字典（逐候选尝试）
+static FF_UNUSED NSDictionary *FFReadPrefsDict(void) {
+    for (NSString *p in FFPrefCandidates()) {
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+        if (d.count) return d;
+    }
+    return nil;
+}
+
+// 写状态文件：供设置页 PSValueCell 从 defaults=com.chargecontrol.<suffix> 域读取。
+// ⚠️ 设置页读的是「jbroot 那份」，所以这里必须写到 jbroot 的 Preferences 目录，
+//    否则设置页永远显示空。按候选顺序写，返回真正落盘的路径（写诊断日志用）。
+static FF_UNUSED NSString *FFWriteDomainPlist(NSString *suffix, NSDictionary *dict) {
+    NSString *rel = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.%@.plist",
+                     FFPrefDomain, suffix];
+    NSMutableArray<NSString *> *cands = [NSMutableArray array];
+    NSString *jb = FFJbrootPrefix();
+    if (jb.length) [cands addObject:[jb stringByAppendingString:rel]];
+    [cands addObject:rel];
+    [cands addObject:[@"/var/jb" stringByAppendingString:rel]];
+    for (NSString *p in cands) {
+        @try {
+            if ([dict writeToFile:p atomically:YES]) return p;
+        } @catch (NSException *e) {}
+    }
+    return nil;
+}
+
+// ---------------------------------------------------------------- 诊断日志目录
+// ⚠️ 必须放 mobile 可写的位置。
+// 教训（v0.1.2 实机）：日志写在 /var/mobile/ForceFastCharge/，该目录是 powerd(root)
+// 创建的 root:mobile 0755 —— SpringBoard 以 mobile 身份运行，**写不进去且静默失败**，
+// 于是"SB 侧一行日志都没有"，白白排查半天。
+// /var/mobile/Documents 是 mobile 拥有、且不会被 RootHide 重定向的位置（多个插件已验证）。
+static FF_UNUSED NSString *FFLogDir(void) {
+    return @"/var/mobile/Documents/ForceFastCharge";
+}
+
+// powerd 侧写的诊断状态文件（SpringBoard 侧读它兜底拿 charging 状态）。
+// v0.1.3：与设置页读的「域文件」分开——域文件是给 PSValueCell 的，
+// 诊断文件字段更全，供人肉排查 / 指示器回退读取。
 static FF_UNUSED NSString *FFStatusPath(void) {
-    return [FFLogDir() stringByAppendingPathComponent:@"status.plist"];
+    return [FFLogDir() stringByAppendingPathComponent:@"ff_status.plist"];
 }
 
 // ---------------------------------------------------------------- 早期诊断
-// 【为什么需要它】v0.1.0/v0.1.1 的 %ctor 用
-//     if (![[NSProcessInfo processInfo].processName isEqualToString:@"powerd"]) return;
-// 做进程判定。实测（CocoaTop 可见 dylib 已在进程内，但零日志/零功能）：
-// 系统守护进程（powerd 等非 App bundle）的 processName 并不保证返回短名，
-// 判定为 false → %ctor 直接 return → 后面所有日志与 hook 一行都不执行，
-// 表现为「注入了却什么都没发生」，极难排查。
-// 这里做两件事：
-//   1) FFBootLog：纯 POSIX 写盘，不依赖 ObjC 运行时/Foundation，
-//      保证只要 dylib 被加载就一定能留下痕迹（含真实进程名）。
-//   2) FFProcName：优先 getprogname()（argv[0] basename，最可靠），
-//      回退 NSProcessInfo.processName，调用方再用「包含匹配」兜底。
+// 纯 POSIX 写盘，不依赖 ObjC 运行时/Foundation，保证只要 dylib 被加载就一定有痕迹。
+// 目录权限用 0777 并显式 chmod：这样无论 powerd(root) 还是 SpringBoard(mobile)
+// 谁先创建，另一个都能继续写。
 static FF_UNUSED void FFBootLog(const char *tag) {
-    mkdir("/var/mobile/ForceFastCharge", 0755);
-    // 多路径回退：万一被注入进程有沙盒限制写不进 /var/mobile，
-    // 仍能在 /var/tmp 留下痕迹——用于严格区分「%ctor 没跑」与「跑了但写盘被拒」。
+    mkdir("/var/mobile/Documents/ForceFastCharge", 0777);
+    chmod("/var/mobile/Documents/ForceFastCharge", 0777);
+    // 多路径回退：万一某进程沙盒限制写不进 /var/mobile，至少 /var/tmp、/tmp 留痕，
+    // 用于严格区分「%ctor 没跑」与「跑了但写盘被拒」。
     const char *cands[3] = {
-        "/var/mobile/ForceFastCharge/boot.log",
+        "/var/mobile/Documents/ForceFastCharge/boot.log",
         "/var/tmp/ff_boot.log",
         "/tmp/ff_boot.log"
     };
@@ -108,7 +228,7 @@ static FF_UNUSED BOOL FFIsProcess(NSString *keyword) {
     if (keyword.length == 0) return NO;
     NSString *k = [keyword lowercaseString];
     NSString *a = [FFProcName() lowercaseString];
-    NSString *b = [[[NSProcessInfo processInfo].processName lastPathComponent] lowercaseString];
+    NSString *b = [[[NSProcessInfo processInfo] processName] lastPathComponent].lowercaseString;
     return ([a rangeOfString:k].location != NSNotFound) ||
            ([b rangeOfString:k].location != NSNotFound);
 }
