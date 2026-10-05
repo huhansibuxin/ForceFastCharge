@@ -1,9 +1,9 @@
 Package: com.chargecontrol.ff
 Name: ForceFastCharge
 Author: huhansibuxin
-Description: 强制充电：系统尝试停充（断流）时拦下该写入，让它继续充到满（仅注入 powerd）。不修改电池状态、不解除内核热保护。
+Description: 强制充电：系统把充电关掉（断流）之后，通过 AppleSMC 把电池充电开关写回「允许」，让它继续充到满。仅注入 powerd；写的值恒为「允许」，不改电量、不伪造读数、不解除内核热保护。
 Depends: mobilesubstrate, preferenceloader
 Maintainer: huhansibuxin
 Section: Tweaks
 Architecture: iphoneos-arm
-Version: 0.3.0
+Version: 0.4.0

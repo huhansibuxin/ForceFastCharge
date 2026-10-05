@@ -27,6 +27,19 @@
 //    实机证据：charging=1 的 47 秒内仅 2 条 refresh（均 win=0），随后 47 秒静默。
 //    修法：每轮无条件先 ensureWindowAsync()（幂等、非阻塞），再做变化检测。
 //
+//  ⭐ v0.4.0 关键修正（判据换了）：「是否显示」改看 **ExternalConnected（有没有插线）**，
+//    不再看 IsCharging（系统有没有正在充）。
+//    起因：老板报「开了常显，插上还是不显示」。翻日志后确认**圆点逻辑本身没错** ——
+//    是**系统在插上线后 2 秒内就把充电停掉了**（IsCharging 1→0），圆点按"充电中"
+//    判据自然隐藏；重插也一样（系统直接拒绝充电，charging 恒为 0）→ 一直不显示。
+//    而「有线但系统拒绝充电」恰恰是最需要被看见的状态 —— 用 charging 当判据
+//    等于"在最该显示的时候不显示"。故改为：
+//      ext（ExternalConnected） → 决定是否显示
+//      charging                 → 决定绿（系统在充）/ 橙（系统没在充）
+//      active（SMC 纠正生效）   → 决定红
+//    另：refresh 日志新增 want= 字段，与 vis 区分 —— vis 读的是**上一拍**的窗口缓存
+//    （刷新是 async 落主线程的，天然滞后一拍），此前这个滞后把排查带偏过。
+//
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -39,8 +52,9 @@
 #import "FFPaths.h"
 
 static BOOL gLastForce    = NO;
+static BOOL gLastExt      = NO;   // v0.4.0：是否显示的主判据（有没有插线）
 static BOOL gLastCharging = NO;
-static BOOL gLastActive   = NO;   // 上一轮「我们有没有拦下系统停充」，纳入变化检测
+static BOOL gLastActive   = NO;   // 上一轮「我们有没有真干活」，纳入变化检测
 static NSInteger gLastMode = -1;
 static CGFloat gLastX = -1, gLastY = -1;   // 坐标也要纳入变化检测，否则改坐标不生效
 static BOOL gEnabled      = NO;   // 是否成功进入运行态
@@ -123,8 +137,28 @@ static CGFloat readDouble(NSString *key, CGFloat def) {
 }
 
 // ---------------------------------------------------------------- 充电状态
-// 自己从 IOPMPowerSource 读，不依赖 powerd 侧的 status.plist——
-// 这样即使 powerd 侧没跑，指示点也能正确区分「充电中 / 未充电」。
+// 两个独立判据，刻意分开读（v0.4.0）：
+//   ext      = ExternalConnected  → **是否显示的主判据**（插着线就该有圆点）
+//   charging = ExternalConnected && IsCharging → 决定颜色是绿还是橙
+// 为什么必须分开：本机实测"插着线但系统拒绝充电"（76% / 0mA / ncr=16）是常态，
+// 只用一个 charging 当判据 → 最该显示的情形（系统不给充）恰好不显示。
+static BOOL readSelfExternal(void) {
+    BOOL ext = NO;
+    @try {
+        mach_port_t mp = MACH_PORT_NULL;
+        if (IOMasterPort(MACH_PORT_NULL, &mp) != KERN_SUCCESS) return NO;
+        io_service_t s = IOServiceGetMatchingService(mp, IOServiceMatching("IOPMPowerSource"));
+        if (!s) return NO;
+        CFTypeRef ec = IORegistryEntryCreateCFProperty(s, CFSTR("ExternalConnected"),
+                                                       kCFAllocatorDefault, 0);
+        if (ec && CFGetTypeID(ec) == CFBooleanGetTypeID())
+            ext = CFBooleanGetValue((CFBooleanRef)ec);
+        if (ec) CFRelease(ec);
+        IOObjectRelease(s);
+    } @catch (NSException *e) {}
+    return ext;
+}
+
 static BOOL readSelfCharging(void) {
     BOOL charging = NO;
     @try {
@@ -181,16 +215,17 @@ static void writeSbStatus(CGFloat cx, CGFloat cy) {
     // 把「此刻圆点该是什么样」也算出来给设置页看 —— 老板不必盯着状态栏就能核对逻辑
     NSString *dotState;
     BOOL visible;
-    if (gLastMode == kFFShowModeOff || !gLastCharging) {
-        visible = NO;
+    if (gLastMode == kFFShowModeOff || !gLastExt) {
+        visible = NO;                       // 模式关闭 / 没插线 → 一律不显示
     } else if (gLastMode != kFFShowModeAlways && !gLastActive) {
-        visible = NO;                       // 非「常显」（即「仅强制」或旧值）：我们没干活 → 不显示
+        visible = NO;                       // 「仅强制」且我们没干活 → 不显示
     } else {
         visible = YES;
     }
-    if (!visible)             dotState = @"不显示";
-    else if (gLastActive)     dotState = @"红 · 正阻止系统断流";
-    else                      dotState = @"绿 · 系统原生充电";
+    if (!visible)              dotState = @"不显示";
+    else if (gLastActive)      dotState = @"红 · 正在强制充电（已纠正停充）";
+    else if (!gLastCharging)   dotState = @"橙 · 有线但系统未充电";
+    else                       dotState = @"绿 · 系统原生充电";
 
     // ① 设置页读的域文件（键名必须与 Root.plist 的 key 逐字一致：
     //    defaults=com.chargecontrol.sbstatus，键 dotLoaded / dotWindow / dotState）
@@ -209,6 +244,7 @@ static void writeSbStatus(CGFloat cx, CGFloat cy) {
         @"loaded"        : @(gEnabled),
         @"windowCreated" : @([FFIndicator windowCreated]),
         @"force"         : @(gLastForce),
+        @"ext"           : @(gLastExt),
         @"charging"      : @(gLastCharging),
         @"active"        : @(gLastActive),
         @"dotState"      : dotState,
@@ -236,33 +272,37 @@ static void refreshIndicator(BOOL forceNotify) {
     [[FFIndicator shared] ensureWindowAsync];
 
     BOOL force    = readBool(kFFForceFastChargeKey, NO);
-    BOOL charging = readCharging();
-    BOOL active   = readForceActive();     // 我们这一轮充电有没有真拦下系统停充 → 决定红/绿
+    BOOL ext      = readSelfExternal();    // v0.4.0：**是否显示的主判据**（插着线就该有圆点）
+    BOOL charging = readCharging();        // 决定颜色绿/橙
+    BOOL active   = readForceActive();     // 我们这一轮有没有真干活 → 决定是否红
     NSInteger mode = readInt(kFFIndicatorModeKey, kFFShowModeForceOnly);
     CGFloat cx = readDouble(kFFDotXKey, kFFDotXDefault);
     CGFloat cy = readDouble(kFFDotYKey, kFFDotYDefault);
 
-    BOOL changed = (force != gLastForce) ||
+    BOOL changed = (force != gLastForce) || (ext != gLastExt) ||
                    (charging != gLastCharging) || (active != gLastActive) ||
                    (mode != gLastMode) || (cx != gLastX) || (cy != gLastY);
 
     gLastForce = force;
-    gLastCharging = charging; gLastActive = active;
+    gLastExt = ext; gLastCharging = charging; gLastActive = active;
     gLastMode = mode; gLastX = cx; gLastY = cy;
 
     if (!forceNotify && !changed) return;   // 无变化不打扰（窗口仍在每轮 ensureWindowAsync 里保活）
 
-    // win=窗口对象是否存在；vis=窗口是否真的可见（已创建且未 hidden）；
-    // scene=主线程缓存的场景激活态；diag=窗口层级/frame/是否挂到 scene 等细节。
-    // 排查「圆点不亮」的三段判据：
-    //   vis=0 且 charging=1、mode=1 ⇒ 逻辑要显示但窗口被隐藏/建不出来
-    //   vis=1 却看不见              ⇒ 看 diag 的 lvl/fr（被遮挡 / 坐标出屏）
-    sbLog(@"refresh force=%d charging=%d active=%d mode=%ld coord=(%.1f,%.1f) win=%d vis=%d scene=%ld [%@]",
-          force, charging, active, (long)mode, cx, cy,
+    // ⚠️ 本轮「逻辑上该不该显示」必须**单独算一份**记进日志，不能靠 vis 判断。
+    //   原因：updateWithExt 是 async 落到主线程的，vis/diagLine 读的是**上一拍**的
+    //   窗口缓存，天然滞后一拍 —— 曾经这个滞后把排查带偏（看起来"该显示却 vis=0"，
+    //   实际那只是上一轮的值）。现在 want 是"此刻的期望值"，vis 是"上一拍的实际值"，
+    //   两者对照就能立刻定位是"逻辑没到"还是"窗口没建/被隐藏"。
+    BOOL wantShow = ext && mode != kFFShowModeOff &&
+                    (mode == kFFShowModeAlways || active);
+
+    sbLog(@"refresh force=%d ext=%d charging=%d active=%d mode=%ld want=%d coord=(%.1f,%.1f) win=%d vis=%d scene=%ld [%@]",
+          force, ext, charging, active, (long)mode, wantShow, cx, cy,
           [FFIndicator windowCreated], [FFIndicator windowVisible],
           (long)[FFIndicator sceneState], [FFIndicator diagLine]);
 
-    [[FFIndicator shared] updateWithCharging:charging active:active mode:mode];
+    [[FFIndicator shared] updateWithExt:ext charging:charging active:active mode:mode];
     writeSbStatus(cx, cy);
 }
 
@@ -339,11 +379,11 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
                     gTick++;
                     if (gTick % 30 == 0) {
                         sbRotateIfTooBig();
-                        sbLog(@"heartbeat pid=%d win=%d vis=%d scene=%ld [%@] force=%d charging=%d active=%d mode=%ld",
+                        sbLog(@"heartbeat pid=%d win=%d vis=%d scene=%ld [%@] force=%d ext=%d charging=%d active=%d mode=%ld",
                               (int)getpid(), [FFIndicator windowCreated],
                               [FFIndicator windowVisible], (long)[FFIndicator sceneState],
                               [FFIndicator diagLine],
-                              gLastForce, gLastCharging, gLastActive, (long)gLastMode);
+                              gLastForce, gLastExt, gLastCharging, gLastActive, (long)gLastMode);
                     }
                     refreshIndicator(NO);
                 } @catch (NSException *e) {}

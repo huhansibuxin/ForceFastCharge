@@ -21,6 +21,26 @@
 //  老板原话：「拦截降流这个功能我们就不要了，就只要强制充电，就是不要让它断流就行。」
 //  ────────────────────────────────────────────────────────────────
 //
+//  ⭐⭐ v0.4.0 关键升级：从「拦截」改为「纠正」（用户态唯一真正能强制充电的路径）
+//  ────────────────────────────────────────────────────────────────
+//  v0.2.x / v0.3.0 的实机取证反复证明「拦 IOKit 写」是空转：
+//    · setterCalls 从 boot 后恒定（22 → 32），整个充电会话内 0 次充电相关写；
+//    · IOConnectCall* 探针显示 powerd 只在**启动期**碰过 AppleSMC(sel 0/1/2) 与
+//      AppleSmartBatteryManager(sel 4)，之后整个充电过程再无任何调用；
+//    · 2026-10-05 复验：上游 SBCPUPowerd 的 8 个电流/功率键、以及停充键，
+//      在全表 24349 行的 IORegistry 里**命中 0 条**（powerd 二进制里也没有这些串）。
+//  ⇒ powerd 是充电状态的**读取者**、不是决策者；这里没有可拦的动作。
+//
+//  真正的充电开关在 **SMC 固件**，用户态唯一通道是 AppleSMC user client：
+//      CH0C bit0 = 1 → 电池充电被禁止   → 写 0 恢复
+//      CH0I bit0 = 1 → 外部供电被切断   → 写 0 恢复
+//  本版**照搬上游 SBCPUChargeSMC 的恢复路径**（与 Battman restore command 同语义）：
+//  系统把充电关掉之后，我们把这两个禁止位写回 0，让充电继续。
+//
+//  ⚠️ 这是全插件**风险最高**的一段（主动写电池管理固件键）。
+//     护栏与上游踩坑记录见 smcEnforceIfNeeded() 上方的注释。
+//  ────────────────────────────────────────────────────────────────
+//
 //  拦什么（powerd 二进制实证存在、且用于停充的键）：
 //    · ChargeInhibit  = 抑制充电   （true/非0 = 禁止充电）
 //    · DisableInflow  = 禁止流入   （true/非0 = 不充电）
@@ -200,6 +220,169 @@ static void ffRotateLogIfTooBig(NSString *path) {
 }
 
 
+// ================================================================ AppleSMC 读写层（v0.4.0）
+//
+// ⭐⭐ 为什么必须有它 —— 这是「强制充电」唯一能落地的地方
+//  ────────────────────────────────────────────────────────────────
+//  v0.2.x / v0.3.0 的实机取证已把「拦 IOKit 写」这条路彻底否掉：
+//    · setterCalls 从 boot 后恒为 22（后 32），整个充电会话内 0 次充电相关写；
+//    · v0.3.0 新增的 IOConnectCall* 探针显示 powerd 只在**启动期**碰过
+//      AppleSmartBatteryManager(selector=4) 与 AppleSMC(selector=0/1/2)，
+//      此后整个充电过程再无任何调用。
+//  ⇒ powerd 对「停充」没有控制权，它只是**读取者**。拦它 = 拦一个不存在的动作。
+//
+//  真正的充电开关在 **SMC 固件**，用户态唯一通道是 AppleSMC user client：
+//    CH0C bit0 : 电池充电开关   （1 = 禁止电池充电 / 停充）
+//    CH0I bit0 : 外部供电流入开关（1 = 切断外部供电）
+//    CH0B      : OBC managed charging（系统"优化电池充电"托管位）
+//    CH0R bit1 : No VBUS（无外部供电时禁止写）
+//    CHCE      : ExternalConnected
+//  语义与「恢复路径」完全对齐上游 SBCPUChargeSMC.m / Battman：
+//    **恢复充电 = 直接写 CH0C = 0**（Battman restore command 同款）。
+//
+//  ⇒ 本插件由此从「拦截」升级为「纠正」：系统把充电关掉之后，我们把它打开。
+//
+//  ⚠️ 这是全插件**风险最高的一段**（主动写电池管理固件键），故设四道护栏：
+//    ① 只在「开关打开 && 有线 && 未在充电 && 温度 < 上限」时才动；
+//    ② 写的值恒为 0（= 恢复出厂默认的"允许"），**绝不写 1**（那才是停充）；
+//    ③ 每次写前后都回读并把结果落盘 —— 出问题能一眼看出是谁写的；
+//    ④ 电池温度超过上限立刻停手（**不绕过原厂热保护**）。
+// ================================================================
+
+#define FF_KEY4(a,b,c,d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | \
+                          (uint32_t)(c) << 8  | (uint32_t)(d))
+
+typedef struct { uint8_t major, minor, build; uint16_t release; } FF_SMCVersion;
+typedef struct { uint16_t version, length; uint32_t cpuPLimit, gpuPLimit, memPLimit; } FF_SMCPLimitData;
+typedef struct { uint32_t dataSize, dataType; uint8_t dataAttributes; } FF_SMCKeyInfo;
+
+typedef struct FF_SMCParamStruct {
+    uint32_t key;
+    struct FF_SMCParam {
+        FF_SMCVersion    vers;
+        FF_SMCPLimitData pLimitData;
+        FF_SMCKeyInfo    keyInfo;
+        uint8_t          result;
+        uint8_t          status;
+        uint8_t          data8;
+        uint32_t         data32;
+        unsigned char    bytes[120];
+    } param;
+} FF_SMCParamStruct;
+
+// ⚠️ AppleSMC 的 user-client 结构体是 **ABI 敏感**的：arm64 上必须是 168 字节。
+//    上游踩过这个坑 —— 把 vers 写成单字节 → 结构体变 164 字节 → 之后所有字段
+//    偏移全错 → AppleSMC 一律回 kIOReturnBadArgument(0xe00002c2)。
+//    这里用编译期断言把它钉死，杜绝"改了字段忘了对齐"的静默失效。
+_Static_assert(sizeof(FF_SMCParamStruct) == 168, "AppleSMC ABI must be 168 bytes");
+
+enum {
+    kFFSMCHandleYPCEvent = 2,   // 所有 SMC 操作都走这个 selector
+    kFFSMCReadKey        = 5,
+    kFFSMCWriteKey       = 6,
+    kFFSMCGetKeyInfo     = 9,
+};
+
+static io_connect_t gSMCConn   = 0;
+static int32_t      gSMCErr    = 0;   // 最近一次 SMC 调用的 IOReturn（0=成功），诊断/上报用
+static volatile BOOL gSMCSelfOpen = NO;  // 标记「这次 IOServiceOpen 是我们自己发的」
+
+// ⚠️ 本层只由 2s tick 单线程调用（见 smcEnforceIfNeeded 的调用点），
+//    刻意不做加锁：SMC 在 powerd 热路径之外，加锁反而引入无谓开销与优先级反转风险。
+static IOReturn ff_smc_call(int index, FF_SMCParamStruct *in, FF_SMCParamStruct *out) {
+    if (gSMCConn == 0) {
+        mach_port_t master = MACH_PORT_NULL;
+        if (IOMasterPort(MACH_PORT_NULL, &master) != KERN_SUCCESS) {
+            gSMCErr = kIOReturnError;
+            return (IOReturn)gSMCErr;
+        }
+        io_service_t svc = IOServiceGetMatchingService(master, IOServiceMatching("AppleSMC"));
+        if (!svc) { gSMCErr = kIOReturnNotFound; return (IOReturn)gSMCErr; }
+        gSMCSelfOpen = YES;          // 让 IOServiceOpen 探针别把我们自己记成"powerd 打开了"
+        IOReturn r = IOServiceOpen(svc, mach_task_self(), 0, &gSMCConn);
+        gSMCSelfOpen = NO;
+        IOObjectRelease(svc);
+        if (r != kIOReturnSuccess) {
+            gSMCConn = 0;
+            gSMCErr  = r;            // 权限不足时这里通常是 kIOReturnNotPermitted
+            return r;
+        }
+    }
+    size_t inSize = sizeof(FF_SMCParamStruct), outSize = sizeof(FF_SMCParamStruct);
+    IOReturn r = IOConnectCallStructMethod(gSMCConn, (uint32_t)index, in, inSize, out, &outSize);
+    if (r != kIOReturnSuccess) gSMCErr = r;
+    return r;
+}
+
+// 读一个 SMC 键。buf 由调用方提供，size 传入容量、返回实际长度。
+static IOReturn ff_smc_read(uint32_t key, void *buf, int32_t *size) {
+    if (!size || *size <= 0 || !buf) return kIOReturnBadArgument;
+
+    FF_SMCParamStruct q = {0}, qo = {0};
+    q.key = key;
+    q.param.data8 = kFFSMCGetKeyInfo;
+    IOReturn r = ff_smc_call(kFFSMCHandleYPCEvent, &q, &qo);
+    if (r != kIOReturnSuccess) return r;
+
+    uint32_t dataSize = qo.param.keyInfo.dataSize;
+    if (dataSize == 0 || dataSize > sizeof(qo.param.bytes)) return kIOReturnBadArgument;
+    if ((uint32_t)*size < dataSize) { *size = (int32_t)dataSize; return kIOReturnNoSpace; }
+
+    FF_SMCParamStruct in = {0}, out = {0};
+    in.key = key;
+    in.param.data8 = kFFSMCReadKey;
+    r = ff_smc_call(kFFSMCHandleYPCEvent, &in, &out);
+    if (r != kIOReturnSuccess) return r;
+
+    memcpy(buf, out.param.bytes, dataSize);
+    *size = (int32_t)dataSize;
+    return kIOReturnSuccess;
+}
+
+// 写一个 SMC 键（长度以该键自己的 dataSize 为准）。
+// ⚠️ 关键判据：IOConnectCallStructMethod 返回成功 ≠ 写入成功 ——
+//    SMC 固件还可能拒绝，只有 out.param.result == 0 才是 SMC 级成功。
+static IOReturn ff_smc_write(uint32_t key, const void *buf, uint32_t size) {
+    if (!buf || size == 0 || size > 120) return kIOReturnBadArgument;
+
+    FF_SMCParamStruct q = {0}, qo = {0};
+    q.key = key;
+    q.param.data8 = kFFSMCGetKeyInfo;
+    IOReturn r = ff_smc_call(kFFSMCHandleYPCEvent, &q, &qo);
+    if (r != kIOReturnSuccess) return r;
+
+    uint32_t dataSize = qo.param.keyInfo.dataSize;
+    if (dataSize == 0 || dataSize > sizeof(qo.param.bytes) || dataSize > size) {
+        return kIOReturnBadArgument;
+    }
+
+    FF_SMCParamStruct in = {0}, out = {0};
+    in.key = key;
+    in.param.data8 = kFFSMCWriteKey;
+    memcpy(in.param.bytes, buf, dataSize);
+    r = ff_smc_call(kFFSMCHandleYPCEvent, &in, &out);
+    if (r != kIOReturnSuccess) return r;
+    if (out.param.result != 0) { gSMCErr = kIOReturnError; return kIOReturnError; }
+    return kIOReturnSuccess;
+}
+
+// ---------------------------------------------------------------- 强制充电状态（v0.4.0）
+// 这些全局量既驱动圆点红/绿，也写进状态文件供设置页与日志核对。
+static int  gSMCLastCH0C = -1;   // 最近读到的 CH0C（1=停充位被置起）
+static int  gSMCLastCH0I = -1;   // 最近读到的 CH0I
+static int  gSMCLastCHCE = -1;   // CHCE：外部电源连接
+static int  gSMCLastCH0R = -1;   // CH0R：bit1 = No VBUS
+static int  gSMCLastCH0B = -1;   // CH0B：OBC 托管
+static int  gSMCSessFix  = 0;    // **本充电会话**成功把充电救回来的次数
+static int  gSMCTotalFix = 0;    // 历史累计
+static BOOL gSMCRecovered = NO;  // 本会话是否靠 SMC 真的把充电救回来过（圆点红/绿判据）
+static int  gSMCFailStreak = 0;  // 连续失败次数（>=3 时降频重试，别刷 SMC）
+static uint64_t gLastSMCWriteNS = 0;
+
+// 电池温度上限（℃）：超过它就不再纠正 —— 宁可充不动，也不绕过原厂热保护。
+// 本机实测「系统停充」发生在 42.5~43.5℃，留 ~2℃ 余量。
+#define FF_SMC_TEMP_LIMIT_C 45.0
+
 // ---------------------------------------------------------------- 开关读取
 // 注意：powerd 以 root 运行，用 CFPreferences 走 mobile 域会串域，
 //      必须像上游 SBCPUChargeEngine 那样直读 plist 文件。
@@ -226,18 +409,21 @@ static int  gStatBlocked  = -1;
 static int  gStatSession  = -1;   // 会话计数也要参与节流，否则「刚拦到停充」不会立即落盘
 static BOOL gStatCharging = NO;
 static BOOL gStatForce    = NO;
+static int  gStatSMC      = -1;   // v0.4.0：SMC 纠正计数也参与节流
 
 static void writeStatusFile(void) {
     if (!gHookInstalled) return;
     // 节流：2s 定时器会频繁调用本函数，内容没变就不重复写盘（省 IO）
     if (gStatBlocked == gBlockedCount && gStatSession == gSessionBlocked &&
-        gStatCharging == gLastCharging && gStatForce == gForceFastCharge) {
+        gStatCharging == gLastCharging && gStatForce == gForceFastCharge &&
+        gStatSMC == gSMCTotalFix) {
         return;
     }
     gStatBlocked  = gBlockedCount;
     gStatSession  = gSessionBlocked;
     gStatCharging = gLastCharging;
     gStatForce    = gForceFastCharge;
+    gStatSMC      = gSMCTotalFix;
 
     NSString *dir = FFLogDir();
     [[NSFileManager defaultManager] createDirectoryAtPath:dir
@@ -248,22 +434,40 @@ static void writeStatusFile(void) {
     NSDictionary *domain = @{
         @"loaded"  : (gHookInstalled ? @"是" : @"否"),
         @"blocked" : [NSString stringWithFormat:@"%d", gBlockedCount],
-        // 「强制充电工作中」= 本次充电会话拦下过系统的停充写 —— 指示点红/绿的判据
-        @"active"  : (gSessionBlocked > 0 ? @"工作中" : @"待命"),
+        @"smcfix"  : [NSString stringWithFormat:@"%d", gSMCTotalFix],
+        // 「强制充电工作中」的判据（v0.4.0 起为两者之一）：
+        //   · gSMCRecovered —— 我们通过 SMC 把被系统关掉的充电真的打开了（主要路径）
+        //   · gSessionBlocked > 0 —— 拦下了系统的停充写（历史路径，本机实测为空转）
+        @"active"  : ((gSMCRecovered || gSessionBlocked > 0) ? @"工作中" : @"待命"),
     };
     FFWriteDomainPlist(@"ffstatus", domain);
 
     // ② 诊断文件（字段更全，人肉排查用）
     //    setterCalls 很关键：若它一直是 0，说明 powerd 压根没调用我们 hook 的那两个
     //    setter（hook 点不对）；若它 >0 而 blockedWriteCount==0，说明调了但键名没命中白名单。
+    //    ⭐ v0.4.0 的 smc* 一组是「强制充电到底能不能做」的直接答案：
+    //      smcCH0C  = 1 而 smcSessionFix = 0 → 系统在停充，但我们写不进去（权限/被覆盖）
+    //      smcCH0C  = 0 而未充电           → 停充发生在更底层，用户态无解
+    //      smcSessionFix > 0               → 功能真的在工作（圆点该是红的）
     NSDictionary *st = @{
         @"hookInstalled"     : @(gHookInstalled),
         @"forceEnabled"      : @(gForceFastCharge),
         @"charging"          : @(gLastCharging),
-        @"active"            : @(gSessionBlocked > 0),
+        @"active"            : @(gSMCRecovered || gSessionBlocked > 0),
         @"sessionBlocked"    : @(gSessionBlocked),
         @"blockedWriteCount" : @(gBlockedCount),
         @"setterCalls"       : @(gSetterCalls),
+        @"smcRecovered"      : @(gSMCRecovered),
+        @"smcSessionFix"     : @(gSMCSessFix),
+        @"smcTotalFix"       : @(gSMCTotalFix),
+        @"smcCH0C"           : @(gSMCLastCH0C),
+        @"smcCH0I"           : @(gSMCLastCH0I),
+        @"smcCH0B"           : @(gSMCLastCH0B),
+        @"smcCHCE"           : @(gSMCLastCHCE),
+        @"smcCH0R"           : @(gSMCLastCH0R),
+        @"smcErr"            : @(gSMCErr),
+        @"smcFailStreak"     : @(gSMCFailStreak),
+        @"smcTempLimitC"     : @(FF_SMC_TEMP_LIMIT_C),
         @"pid"               : @((int)getpid()),
         @"updatedAt"         : [[NSDate date] description]
     };
@@ -284,54 +488,186 @@ static void updateChargeState(void) {
 }
 
 // ---------------------------------------------------------------- 充电状态
-// 读 IOPMPowerSource 的 ExternalConnected/IsCharging；状态变化时 post
-// FFChargeStateNotif，驱动 SpringBoard 侧指示点显示/隐藏。
-static BOOL readIsCharging(void) {
-    BOOL charging = NO;
-    @try {
-        mach_port_t mp = MACH_PORT_NULL;
-        if (IOMasterPort(MACH_PORT_NULL, &mp) != KERN_SUCCESS) return NO;
-        io_service_t s = IOServiceGetMatchingService(mp, IOServiceMatching("IOPMPowerSource"));
-        if (!s) return NO;
-        CFTypeRef ec = IORegistryEntryCreateCFProperty(s, CFSTR("ExternalConnected"),
-                                                       kCFAllocatorDefault, 0);
-        CFTypeRef ic = IORegistryEntryCreateCFProperty(s, CFSTR("IsCharging"),
-                                                       kCFAllocatorDefault, 0);
-        if (ec && CFGetTypeID(ec) == CFBooleanGetTypeID())
-            charging = CFBooleanGetValue((CFBooleanRef)ec);
-        if (ic && CFGetTypeID(ic) == CFBooleanGetTypeID())
-            charging = charging && CFBooleanGetValue((CFBooleanRef)ic);
-        if (ec) CFRelease(ec);
-        if (ic) CFRelease(ic);
-        IOObjectRelease(s);
-    } @catch (NSException *e) {}
-    return charging;
-}
+// v0.4.0：原来这里有个 readIsCharging()，现已被 readBatteryTelemetry() 取代
+//（pollChargeState 需要同时拿到 ExternalConnected 与 IsCharging，一次读取更省）。
+// 删掉而不是留着，避免 -Wunused-function 在 CI 上变成噪声甚至失败。
+
+static BOOL gLastExt = NO;   // 上一轮的外部电源状态（v0.4.0：用它的上升沿划"充电会话"边界）
 
 static void pollChargeState(void) {
-    BOOL charging = readIsCharging();
-    if (charging == gLastCharging) return;   // 无变化不打扰
-    gLastCharging = charging;
-    if (charging) {
-        // 新一次充电会话开始 → 重置「我们有没有在工作」的判据。
-        // 不重置的话，上一次充电拦到过降流会让圆点永远停在红色。
+    NSDictionary *t = readBatteryTelemetry();     // 一次读取，ext / charging 都用它
+    BOOL ext      = [t[@"ExternalConnected"] boolValue];
+    BOOL charging = [t[@"IsCharging"] boolValue];
+
+    // ⭐ v0.4.0：会话边界改用 **ExternalConnected 的上升沿**（插线），
+    //   而不是"charging 变 YES"。原因：本机实测系统经常**直接拒绝充电**
+    //   （插上就是 IsCharging=NO），charging 永远不出现 YES 沿 —— 那样旧会话的
+    //   "已恢复"计数会一直残留 → 圆点永远停在红/绿的错误状态。
+    if (ext && !gLastExt) {
         gSessionBlocked = 0;
-        logDiag(@"charging session start -> sessionBlocked reset");
+        gSMCSessFix     = 0;
+        gSMCRecovered   = NO;
+        gSMCFailStreak  = 0;
+        logDiag(@"charging session start (plugged) -> counters reset");
     }
-    logDiag(@"charging state -> %@", charging ? @"YES" : @"NO");
-    if (!charging) {
-        // ⭐ v0.2.1 关键取证：系统**为什么**停充。
-        //   NotChargingReason: 0=正常、128=未接充电器、其余=被限（温度/电量/策略…）
-        //   TimeChargingThermallyLimited: 因温控被限流的累计秒数
-        //   分水岭判读：
-        //     · ncr 非 0/128 且 sessionBlocked==0 → 停充**不经过 powerd**
-        //       （内核 SMC 直控），我们拦不到 —— 这是"功能无效"，不是"没触发"。
-        //     · sessionBlocked>0 → 系统本来要停充，被我们挡住了（圆点该是红的）。
-        logDiag(@"charge stop reason: %@ sessionBlocked=%d",
-                ffTelemetryLine(readBatteryTelemetry()), gSessionBlocked);
+    BOOL extChanged = (ext != gLastExt);
+    gLastExt = ext;
+
+    if (charging != gLastCharging) {
+        gLastCharging = charging;
+        logDiag(@"charging state -> %@", charging ? @"YES" : @"NO");
+        if (!charging) {
+            // ⭐ 关键取证：系统**为什么**停充，以及我们有没有动手、动得成不成。
+            //   ncr=0 正常 / 128 未接充电器 / 其余 = 被限（温度、电量、策略…）。
+            //   smcCH0C = 1 且 smcFix = 0 → 系统的确关掉了充电开关，但我们没能写回去；
+            //   smcCH0C = 0 且未充电     → 停充在 SMC 更底层，用户态无解。
+            logDiag(@"charge stop reason: %@ sessionBlocked=%d smcFix=%d smcCH0C=%d smcErr=0x%08x",
+                    ffTelemetryLine(t), gSessionBlocked, gSMCSessFix, gSMCLastCH0C,
+                    (unsigned)gSMCErr);
+        }
+        writeStatusFile();
+        notify_post(FFChargeStateNotifName.UTF8String);
+        return;
     }
-    writeStatusFile();                       // 让指示器读到最新 charging
-    notify_post(FFChargeStateNotifName.UTF8String);
+    if (extChanged) {
+        // ext 翻转（插/拔线）立刻落盘并通知 —— 圆点必须跟着插拔立即变，
+        // 不能等下一次状态轮询（老板 v0.3.0 反馈的核心体验问题）。
+        writeStatusFile();
+        notify_post(FFChargeStateNotifName.UTF8String);
+    }
+}
+
+// ---------------------------------------------------------------- 强制充电主逻辑（v0.4.0）
+// ⭐ 实现**照搬上游 SBCPUChargeSMC 的恢复路径**（与 Battman restore command 同语义）：
+//    系统把充电关掉之后，我们把 SMC 里的「禁止位」写回 0。
+//
+//      CH0C bit0 = 1 → 电池充电被禁止   → 写 0 恢复
+//      CH0I bit0 = 1 → 外部供电被切断   → 写 0 恢复
+//
+//  ⚠️ 上游踩过的两个坑，这里刻意照抄其结论（不是自创）：
+//    ① **恢复路径不做 CHCE / CH0R / OBC 安全检查**。
+//       上游 V4.28 的教训：一旦禁止位生效，SMC 可能把 CH0R bit1 报成 No VBUS
+//       （哪怕线物理上还插着）；若用这个状态去拒绝"恢复"，设备会**卡死在阻断态**。
+//       所以这里 CH0R 只记录、不参与判断。
+//    ② **写后必须回读确认**（上游 V4.29 的教训）：
+//       IOConnectCallStructMethod 返回成功 ≠ SMC 接受；而且系统可能立刻覆盖回去。
+//       只有回读 bit0 == 0 才算真的成功。
+static void smcEnforceIfNeeded(void) {
+    if (!gForceFastCharge) return;
+
+    NSDictionary *t = readBatteryTelemetry();
+    BOOL   ext      = [t[@"ExternalConnected"] boolValue];
+    BOOL   charging = [t[@"IsCharging"] boolValue];
+    double tempC    = [t[@"Temperature"] doubleValue] / 100.0;   // IOKit 给的是 1/100 ℃
+    int    ncr      = [t[@"NotChargingReason"] intValue];
+
+    // 没插电 / 本来就在正常充 → 无事可做，绝不打扰系统
+    if (!ext || charging) return;
+
+    // 温度护栏（本插件自加，上游没有）：超上限就不纠正，宁可充不动，
+    // 也不在这一层绕过原厂热保护。理由见 README「风险」一节。
+    if (tempC >= FF_SMC_TEMP_LIMIT_C) {
+        static uint64_t lastWarn = 0;
+        uint64_t n = (uint64_t)dispatch_time(DISPATCH_TIME_NOW, 0);
+        if (n - lastWarn > (uint64_t)(60.0 * NSEC_PER_SEC)) {
+            lastWarn = n;
+            logDiag(@"smc: SKIP 温度 %.1fC >= %.0fC 上限 —— 不绕过原厂热保护 ncr=%d",
+                    tempC, FF_SMC_TEMP_LIMIT_C, ncr);
+        }
+        return;
+    }
+
+    // 读 SMC 现场（CHCE / CH0R / CH0B 只作诊断，不参与判断 —— 见上文①）
+    uint8_t  ch0c = 0, ch0i = 0, chce = 0, ch0b = 0;
+    uint32_t ch0r = 0;
+    int32_t  s1 = 1, s4 = 4;
+    IOReturn rC = ff_smc_read(FF_KEY4('C','H','0','C'), &ch0c, &s1);
+    s1 = 1;  IOReturn rI = ff_smc_read(FF_KEY4('C','H','0','I'), &ch0i, &s1);
+    s1 = 1;  IOReturn rE = ff_smc_read(FF_KEY4('C','H','C','E'), &chce, &s1);
+    IOReturn rR = ff_smc_read(FF_KEY4('C','H','0','R'), &ch0r, &s4);
+    s1 = 1;  IOReturn rB = ff_smc_read(FF_KEY4('C','H','0','B'), &ch0b, &s1);
+
+    if (rC != kIOReturnSuccess) {
+        gSMCFailStreak++;
+        logThrottled(@"smc: read CH0C failed io=0x%08x smcErr=0x%08x（AppleSMC 权限不足？）streak=%d",
+                     (unsigned)rC, (unsigned)gSMCErr, gSMCFailStreak);
+        return;
+    }
+    gSMCLastCH0C = ch0c;
+    gSMCLastCH0I = (rI == kIOReturnSuccess) ? ch0i : -1;
+    gSMCLastCHCE = (rE == kIOReturnSuccess) ? chce : -1;
+    gSMCLastCH0B = (rB == kIOReturnSuccess) ? ch0b : -1;
+    gSMCLastCH0R = (rR == kIOReturnSuccess) ? (int)ch0r : -1;
+
+    BOOL needC = ((ch0c & 1) != 0);                       // 电池充电被禁止
+    BOOL needI = (rI == kIOReturnSuccess && (ch0i & 1));  // 外部供电被切断
+
+    // ⭐ 决定性判据：两个禁止位**都是 0** 却仍未充电 ⇒ 停充发生在 SMC 更底层
+    //   （温度/VBUS/电量策略，或电池自身不请求充电）⇒ 用户态无解，别再空转。
+    //   这条分支的存在，正是为了把「我们没工作」与「我们做了但没用」分开。
+    if (!needC && !needI) {
+        gSMCFailStreak = 0;
+        logThrottled(@"smc: CH0C=0x%02x CH0I=0x%02x 均为允许，但未充电 → 停充不在这一层 "
+                     @"ncr=%d temp=%.1fC CH0R=0x%08x CH0B=0x%02x",
+                     ch0c, ch0i, ncr, tempC, ch0r, ch0b);
+        return;
+    }
+
+    // 写节流：正常 10s 一次；连续失败 ≥3 次降为 60s 一次，避免对着 SMC 空转刷屏。
+    uint64_t now = (uint64_t)dispatch_time(DISPATCH_TIME_NOW, 0);
+    uint64_t gap = (gSMCFailStreak >= 3) ? (uint64_t)(60.0 * NSEC_PER_SEC)
+                                         : (uint64_t)(10.0 * NSEC_PER_SEC);
+    if (now - gLastSMCWriteNS < gap) return;
+    gLastSMCWriteNS = now;
+
+    uint8_t zero = 0;
+    BOOL okC = NO, okI = NO;
+
+    if (needC) {
+        IOReturn w = ff_smc_write(FF_KEY4('C','H','0','C'), &zero, 1);
+        if (w != kIOReturnSuccess) {
+            logDiag(@"smc: 写 CH0C=0 失败 io=0x%08x smcErr=0x%08x", (unsigned)w, (unsigned)gSMCErr);
+        } else {
+            uint8_t back = 0xFF; int32_t sv = 1;
+            IOReturn rb = ff_smc_read(FF_KEY4('C','H','0','C'), &back, &sv);
+            okC = (rb == kIOReturnSuccess && (back & 1) == 0);
+            gSMCLastCH0C = back;
+            if (!okC) logDiag(@"smc: CH0C 写 0 后回读仍 0x%02x（io=0x%08x）—— 被系统立刻覆盖",
+                              back, (unsigned)rb);
+        }
+    } else {
+        okC = YES;   // 本来就没被禁
+    }
+
+    if (needI) {
+        IOReturn w = ff_smc_write(FF_KEY4('C','H','0','I'), &zero, 1);
+        if (w != kIOReturnSuccess) {
+            logDiag(@"smc: 写 CH0I=0 失败 io=0x%08x smcErr=0x%08x", (unsigned)w, (unsigned)gSMCErr);
+        } else {
+            uint8_t back = 0xFF; int32_t sv = 1;
+            IOReturn rb = ff_smc_read(FF_KEY4('C','H','0','I'), &back, &sv);
+            okI = (rb == kIOReturnSuccess && (back & 1) == 0);
+            gSMCLastCH0I = back;
+            if (!okI) logDiag(@"smc: CH0I 写 0 后回读仍 0x%02x（io=0x%08x）—— 被系统立刻覆盖",
+                              back, (unsigned)rb);
+        }
+    } else {
+        okI = YES;
+    }
+
+    if (okC && okI) {
+        gSMCSessFix++;
+        gSMCTotalFix++;
+        gSMCFailStreak = 0;
+        gSMCRecovered  = YES;             // 圆点转红：我们真的在阻止系统断流
+        logDiag(@"smc: FIX 停充已纠正 CH0C %d→0 CH0I %d→0（本会话第 %d 次 / 累计 %d）ncr=%d %@",
+                (needC ? 1 : 0), (needI ? 1 : 0), gSMCSessFix, gSMCTotalFix, ncr,
+                ffTelemetryLine(t));
+        writeStatusFile();                // 立即落盘 + 通知 SpringBoard 翻红
+        notify_post(FFChargeStateNotifName.UTF8String);
+    } else {
+        gSMCFailStreak++;
+    }
 }
 
 // ---------------------------------------------------------------- 属性分类
@@ -638,7 +974,9 @@ static kern_return_t hook_IOServiceOpen(io_service_t service, task_port_t owning
                                         uint32_t type, io_connect_t *connect) {
     kern_return_t kr = orig_SvcOpen ? orig_SvcOpen(service, owningTask, type, connect)
                                     : KERN_FAILURE;
-    if (kr == KERN_SUCCESS) {
+    // ⚠️ v0.4.0：跳过「我们自己开 AppleSMC」的那一次 —— 否则日志里会出现
+    //    重复的 "IO service opened: AppleSMC"，让人误判 powerd 又去开了一次 SMC。
+    if (kr == KERN_SUCCESS && !gSMCSelfOpen) {
         @try {
             io_name_t cls = {0};
             if (IOObjectGetClass(service, cls) == KERN_SUCCESS && cls[0]) {
@@ -722,17 +1060,18 @@ static void heartbeatTick(void) {
     //   无法分辨「他拔线了(ext=0)」还是「线插着系统停充(ext=1)」。放电静置时
     //   每 60s 带一次 ext/ncr/temp，任何时刻取日志都能一眼判定线在不在、
     //   系统是不是在限流（vac 被压低 / ncr 非 0）。
-    if (gLastCharging) {
-        logDiag(@"heartbeat charging pid=%d hooks=%d force=%d %@ sessionBlocked=%d blocked=%d setterCalls=%d",
-                (int)getpid(), gHookInstalled, gForceFastCharge,
-                ffTelemetryLine(readBatteryTelemetry()),
-                gSessionBlocked, gBlockedCount, gSetterCalls);
-    } else {
-        logDiag(@"heartbeat idle pid=%d hooks=%d force=%d %@ sessionBlocked=%d blocked=%d setterCalls=%d",
-                (int)getpid(), gHookInstalled, gForceFastCharge,
-                ffTelemetryLine(readBatteryTelemetry()),
-                gSessionBlocked, gBlockedCount, gSetterCalls);
-    }
+    //   （两个分支内容已一致，合并成一条；输出的仍是 "heartbeat idle pid=" /
+    //    "heartbeat charging pid="，老的 grep 习惯不受影响。）
+    // ⭐ v0.4.0 加 smc 一组：任何时刻取**一行**心跳，就能同时判断
+    //   「系统的充电开关现在开还是关」「我们救回来过几次」「SMC 通道通不通」。
+    logDiag(@"heartbeat %@ pid=%d hooks=%d force=%d %@ sessionBlocked=%d blocked=%d setterCalls=%d "
+            @"smc[CH0C=%d CH0I=%d CH0B=%d CHCE=%d CH0R=%d fix=%d/%d err=0x%08x streak=%d rec=%d]",
+            gLastCharging ? @"charging" : @"idle",
+            (int)getpid(), gHookInstalled, gForceFastCharge,
+            ffTelemetryLine(readBatteryTelemetry()),
+            gSessionBlocked, gBlockedCount, gSetterCalls,
+            gSMCLastCH0C, gSMCLastCH0I, gSMCLastCH0B, gSMCLastCHCE, gSMCLastCH0R,
+            gSMCSessFix, gSMCTotalFix, (unsigned)gSMCErr, gSMCFailStreak, (int)gSMCRecovered);
 }
 
 // Darwin 通知回调（CFNotificationCenter 形态，对齐上游 SBCPUPowerd.xm 签名）
@@ -819,7 +1158,11 @@ static void settingsChanged(CFNotificationCenterRef center, void *observer,
                     gTickCount++;
                     updateChargeState();
                     pollChargeState();
-                    heartbeatTick();     // v0.2.1：60s 一次存活心跳（含充电遥测）
+                    // ⭐ v0.4.0 核心：系统停充就把 SMC 的充电开关写回"允许"。
+                    //   放在 pollChargeState 之后 —— 那边刚刷新的 ext/charging 状态
+                    //   决定这里要不要动手（只在"有线但没充"时才介入）。
+                    smcEnforceIfNeeded();
+                    heartbeatTick();     // v0.2.1：60s 一次存活心跳（含充电遥测 + SMC 现场）
                 }
             });
             dispatch_resume(gTimer);

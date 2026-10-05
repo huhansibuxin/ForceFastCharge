@@ -9,7 +9,7 @@
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
 			<key>label</key><string>强制充电（阻止系统断流）</string>
-			<key>footerText</key><string>系统有时会（温度偏高、充电策略判定等）把充电电流降到 0mA，也就是「断流」。打开下面的开关后，一旦系统尝试停充，本插件会拦下这次写入，让它继续充到满。</string>
+			<key>footerText</key><string>系统有时会（电池温度偏高、充电策略判定等）把充电电流降到 0mA，也就是「断流」。打开下面的开关后，一旦检测到「有线、但没在充电」，本插件会通过电池管理固件（AppleSMC）把充电开关写回「允许」，让它继续充到满。</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSSwitchCell</string>
@@ -20,14 +20,18 @@
 		</dict>
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
-			<key>footerText</key><string>工作原理：只拦「停充」这一类写入（ChargeInhibit / DisableInflow），不伪造电池读数、不修改电量、不主动写任何属性，也不碰「充电上限百分比」。若系统停充是由内核热保护直接执行的（不经过用户态），插件拦不到 —— 那时红点不会亮，也不会造成任何影响。</string>
+			<key>footerText</key><string>实现方式：直接读写电池管理固件里的充电开关位（CH0C / CH0I），把它们写回「允许」—— 与上游 SBCPUChargeSMC / Battman 的恢复命令同语义。写入的值恒为 0（允许），不伪造电池读数、不修改电量、不碰「充电上限百分比」，也不改温度保护策略。
+⚠️ 电池温度超过 45℃ 时自动停手（不绕过原厂热保护）。</string>
 		</dict>
 
 		<!-- ===================== 指示点 ===================== -->
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
 			<key>label</key><string>状态指示点</string>
-			<key>footerText</key><string>红点 = 我们强制让它充 —— 拦下了系统的停充写、正在阻止断流（插件真的在干活）。绿点 = 电池自己的颜色 —— 系统原生充电，我们没介入。不充电时一律不显示。圆点只覆盖自身 24×24 区域、不接收触摸，不影响系统手势。</string>
+			<key>footerText</key><string>橙点 = 有线，但系统没在充电（我们没介入 / 介入没成功）—— 看到它就说明系统正在断流。
+红点 = 我们的强制充电正在生效（已把系统关掉的充电打开）。
+绿点 = 系统原生充电，我们没干预。
+没插线时一律不显示。圆点只覆盖自身 8×8 区域、不接收触摸，不影响系统手势。</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSSegmentCell</string>
@@ -40,7 +44,8 @@
 		</dict>
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
-			<key>footerText</key><string>仅强制（默认）：只有我们真在阻止断流时才亮红点 —— 圆点即「插件有没有起作用」的唯一判断点。常显：只要在充电就显示（我们没介入时是绿点，也就是电池本来的颜色）。两个模式在没充电时都不显示。</string>
+			<key>footerText</key><string>仅强制（默认）：只有我们真在强制充电时才亮红点 —— 圆点即「插件有没有起作用」的唯一判断点。
+常显：只要插着线就显示（系统正常充是绿点；系统停充是橙点；我们介入成功转红点）。</string>
 		</dict>
 
 		<dict>
@@ -74,7 +79,8 @@
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
 			<key>label</key><string>运行状态</string>
-			<key>footerText</key><string>「powerd 已加载」= 强制充电核心有没有注入成功；「是否在干活」= 本轮充电有没有真的拦下系统停充（红点判据）；「已拦截停充次数」累计增长代表确实在拦。「圆点当前状态」是此刻圆点应该显示的样子，不必盯着状态栏核对。若显示未加载，SSH 查 /var/mobile/Documents/ForceFastCharge/boot.log 与 sb.log。</string>
+			<key>footerText</key><string>「powerd 已加载」= 强制充电核心有没有注入成功；「是否在干活」= 本轮有没有真的把系统关掉的充电打开（红点判据）；「SMC 纠正次数」累计增长就代表确实在纠正停充。
+「圆点当前状态」是此刻圆点应该显示的样子，不必盯着状态栏核对。若显示未加载，SSH 查 /var/mobile/Documents/ForceFastCharge/boot.log 与 sb.log。</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSValueCell</string>
@@ -87,6 +93,12 @@
 			<key>defaults</key><string>com.chargecontrol.ffstatus</string>
 			<key>key</key><string>active</string>
 			<key>label</key><string>强制充电是否在干活</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSValueCell</string>
+			<key>defaults</key><string>com.chargecontrol.ffstatus</string>
+			<key>key</key><string>smcfix</string>
+			<key>label</key><string>SMC 纠正次数</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSValueCell</string>
@@ -122,7 +134,7 @@
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
 			<key>label</key><string>效果边界与风险</string>
-			<key>footerText</key><string>⚠️ 本插件的作用是「系统想停充时不让它停」。若停充源于机身过热，强行继续充会加速电池老化 —— 是否使用请自行权衡。
+			<key>footerText</key><string>⚠️ 本插件的作用是「系统想停充时不让它停」。若停充源于机身过热，强行继续充会加速电池老化 —— 是否使用请自行权衡。内置 45℃ 上限：电池温度超过它就不再介入。
 另：iOS 用户态没有「提高充电电流」的接口（充电电流由内核 + 电池管理芯片决定），所以本插件做不到「让充电更快」，只能做到「不让它中断」。
 诊断日志：/var/mobile/Documents/ForceFastCharge/（boot.log / ffcharge.log / sb.log，安装或升级时自动清除）。</string>
 		</dict>

@@ -8,15 +8,21 @@
 //   · 坐标从偏好读取、可配置；空/0/非法一律回退默认，并 clamp 进屏幕
 //   · 全程 @try/@catch 兜底，任何异常静默失败，绝不影响 SpringBoard
 //
-//  颜色语义（v0.2.0，老板定调）：
-//   红 = **我们强制让它充** —— 拦下了系统的停充写，正在阻止断流。
-//        真机场景：温度高时系统会把充电电流砍到 0mA，我们顶住让它继续充到满，此时亮红。
+//  颜色语义（v0.4.0，老板定调 + 实机修正）：
+//   红 = **我们强制让它充** —— 通过 SMC 把系统关掉的充电开关打开了，正在阻止断流。
+//        真机场景：温度高时系统会把充电电流砍到 0mA，我们把它救回来，此时亮红。
+//   橙 = **有线，但系统没在充电** —— 我们没干预（模式不对/温度超上限）或干预失败。
+//        ⭐ v0.4.0 新增。为什么必须有它：本机实测"插着线却 0mA"是常态，
+//        没有这一色就分不清"系统充得好好的"与"系统压根不给充"。
 //   绿 = **电池自己的颜色** —— 系统原生充电，我们没干预。
-//   不充电 = 两个模式都一律不显示（拔线即消失）
+//   不显示 = 没插线（两个模式都一致）；或「仅强制」模式下我们没在干活。
+//
+//  ⚠️ 是否显示的主判据（v0.4.0 起）是 **ExternalConnected（有没有插线）**，
+//    不再是 IsCharging（系统有没有在充）。原因见 updateWithExt: 的声明处。
 //
 //  模式（只有两个，见 kFFShowModeAlways / kFFShowModeForceOnly）：
-//   常显   ：只要在充电就显示（绿打底，我们介入时转红）
-//   仅强制 ：只有我们真的拦下停充时才显示红点；我们没干活就不显示
+//   常显   ：只要插着线就显示（绿打底 → 系统停充转橙 → 我们介入转红）
+//   仅强制 ：只有我们真的在干活时才显示红点；我们没干活就不显示
 //
 //  ⭐ v0.3.0 关键修复（老板实机：「开了常显，插上还是不显示」）
 //   根因：刷新入口 refreshIndicator() 把「状态无变化就 return」放在了
@@ -66,12 +72,17 @@
 // 而不必傻等下一次"状态变化"（v0.2.2 实机「插上不亮」的根因）。
 - (void)ensureWindowAsync;
 // 依据当前状态更新圆点：显示/隐藏 + 颜色
-//   charging: 是否正在充电（为 NO 时两个模式都不显示）
-//   active  : 我们的强制充电这一轮有没有真的拦下系统停充（sessionBlocked > 0）
-//   mode    : kFFShowModeAlways / kFFShowModeForceOnly（其余值按「仅强制」处理 —— 宁可不显示）
-- (void)updateWithCharging:(BOOL)charging
-                    active:(BOOL)active
-                      mode:(NSInteger)mode;
+//   ext     : 是否有外部电源 —— ⭐ v0.4.0 起这是**是否显示的主判据**
+//             为什么不再用 charging：本机实测系统经常「有线但拒绝充电」
+//             （76% / 0mA / ncr=16），而那恰恰是老板最需要看见的状态；
+//             用 charging 当判据会出现"最该显示的时候恰好不显示"。
+//   charging: 系统是否正在充电（决定 绿 / 橙）
+//   active  : 我们的强制充电这一轮有没有真的生效（决定 红）
+//   mode    : kFFShowModeAlways / kFFShowModeForceOnly（其余值按「仅强制」处理）
+- (void)updateWithExt:(BOOL)ext
+             charging:(BOOL)charging
+               active:(BOOL)active
+                 mode:(NSInteger)mode;
 @end
 
 // 私有方法前置声明（两者都在 @implementation 内定义，但调用点在前）
@@ -295,9 +306,10 @@ static CGFloat ff_clampY(CGFloat y) {
     g_dot.frame = CGRectMake(ff_clampX(cx) - 4, ff_clampY(cy) - 4, 8, 8);
 }
 
-- (void)updateWithCharging:(BOOL)charging
-                    active:(BOOL)active
-                      mode:(NSInteger)mode {
+- (void)updateWithExt:(BOOL)ext
+             charging:(BOOL)charging
+               active:(BOOL)active
+                 mode:(NSInteger)mode {
     // ⚠️ 必须切主线程：调用方（SpringBoard 侧轮询）跑在后台队列，
     //    跨线程操作 UIKit 会让 SpringBoard 崩溃循环 → 黑屏。
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -305,16 +317,23 @@ static CGFloat ff_clampY(CGFloat y) {
             [self ensureWindow];
             if (!g_win) return;
 
-            // 先算出「这一轮该不该显示」，最后一次性落地，避免重复赋值抖动
-            BOOL wantHidden = YES;
-            BOOL skip = (mode == kFFShowModeOff) || !charging;
-            if (!skip) {
+            // 先算出「这一轮该不该显示、什么颜色」，最后一次性落地，避免重复赋值抖动
+            BOOL wantHidden = YES;   // 没插线 / 模式关闭 → 一律不显示
+            BOOL wantRed    = NO;    // 红：我们正在阻止系统断流（强制充电生效中）
+            BOOL wantOrange = NO;    // 橙：有线，但系统没在充电，我们也没能扭转
+
+            if (ext && mode != kFFShowModeOff) {
                 if (mode == kFFShowModeAlways) {
-                    wantHidden = NO;                 // 常显：充电中就显示
+                    // 常显：只要**插着线**就显示（不再要求"系统正在充电"——
+                    // 否则系统一停充圆点就消失，正好丢掉最有用的那个信号）
+                    wantHidden = NO;
+                    wantRed    = active;
+                    wantOrange = (!active && !charging);
                 } else {
                     // 仅强制（默认，含任何未识别的旧值）—— 只有一个判断点：
                     // 我们真在干活才显示。宁可不显示，也不要亮一个"看起来在工作"的点。
                     wantHidden = !active;
+                    wantRed    = active;
                 }
             }
 
@@ -322,12 +341,17 @@ static CGFloat ff_clampY(CGFloat y) {
                 // 坐标每次刷新都重算（设置页可改）
                 [self moveToCoord:ff_coord(kFFDotXKey, kFFDotXDefault)
                                cy:ff_coord(kFFDotYKey, kFFDotYDefault)];
-                // 只有两个颜色：
-                //   红 = 我们正在拦系统降流（强制快充确实在工作）
+                // 三种颜色：
+                //   红 = 我们的强制充电正在生效（把系统关掉的充电打开了）
+                //   橙 = 有线但系统没在充电（我们没干预 / 干预了没成）—— 诊断信号
                 //   绿 = 系统原生充电（我们没介入，系统自己就充得很好）
-                g_dot.backgroundColor = active
-                    ? [UIColor colorWithRed:1.00 green:0.23 blue:0.19 alpha:1.0]   // 红
-                    : [UIColor colorWithRed:0.20 green:0.78 blue:0.35 alpha:1.0];  // 绿
+                if (wantRed) {
+                    g_dot.backgroundColor = [UIColor colorWithRed:1.00 green:0.23 blue:0.19 alpha:1.0];
+                } else if (wantOrange) {
+                    g_dot.backgroundColor = [UIColor colorWithRed:1.00 green:0.58 blue:0.00 alpha:1.0];
+                } else {
+                    g_dot.backgroundColor = [UIColor colorWithRed:0.20 green:0.78 blue:0.35 alpha:1.0];
+                }
                 g_dot.hidden = NO;
             }
             if (g_win.hidden != wantHidden) {
