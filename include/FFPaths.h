@@ -88,7 +88,9 @@ static FF_UNUSED NSString *FFJbrootPrefix(void) {
                 }
             } @catch (NSException *e) {}
 
-            // ② 目录扫描（系统进程里 dladdr 可能只给逻辑路径，拿不到 .jbroot- 串）
+            // ② 目录扫描（系统进程里 dladdr 可能只给逻辑路径，拿不到 .jbroot- 串）。
+            //    ⚠️ 每次重启 jbroot 随机串都会变，旧目录可能残留 → 不能盲取第一个，
+            //    优先选「里面确实有本插件偏好文件」的那个，避免读到已废弃的旧 jbroot。
             if (!prefix.length) {
                 @try {
                     NSFileManager *fm = [NSFileManager defaultManager];
@@ -96,15 +98,24 @@ static FF_UNUSED NSString *FFJbrootPrefix(void) {
                         @"/var/containers/Bundle/Application",
                         @"/var/mobile/Containers/Shared/AppGroup"
                     ];
+                    NSString *probe = [NSString stringWithFormat:
+                        @"/var/mobile/Library/Preferences/%@.plist", FFPrefDomain];
+                    NSString *firstFound = nil;
                     for (NSString *base in bases) {
                         for (NSString *e in [fm contentsOfDirectoryAtPath:base error:nil]) {
-                            if ([e hasPrefix:@".jbroot-"]) {
-                                prefix = [base stringByAppendingPathComponent:e];
+                            if (![e hasPrefix:@".jbroot-"]) continue;
+                            NSString *cand = [base stringByAppendingPathComponent:e];
+                            if (!firstFound) firstFound = cand;
+                            // 命中「偏好文件存在」→ 这就是当前活跃的 jbroot，直接采用
+                            if ([fm fileExistsAtPath:[cand stringByAppendingString:probe]]) {
+                                firstFound = cand;
+                                prefix = cand;
                                 break;
                             }
                         }
                         if (prefix.length) break;
                     }
+                    if (!prefix.length && firstFound) prefix = firstFound;
                 } @catch (NSException *e) {}
             }
         }
@@ -122,13 +133,35 @@ static FF_UNUSED NSString *FFJbrootPath(NSString *absPath) {
 }
 
 // ---------------------------------------------------------------- 偏好读写路径
-// 读：把 jbroot 版、真实版、/var/jb 版都试一遍，取第一个存在的
-// （powerd / SpringBoard / 设置页三者所处的"路径域"不完全一致，多试最稳）
+// 读：把「所有能发现的 jbroot 版本」+ 真实版 + /var/jb 版都列上，逐个试、
+//     取第一个真正含关键键的（见 FFReadPrefsDict）。
+// ⚠️ 只列「自己推导出的那一个 jbroot」不够稳：若推导偏了（dladdr 拿不到、
+//    扫描撞上残留旧目录），就会整个读空。这里把所有 .jbroot-* 都枚举进来兜底。
 static FF_UNUSED NSArray<NSString *> *FFPrefCandidates(void) {
     NSString *rel = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", FFPrefDomain];
-    NSMutableArray *a = [NSMutableArray array];
+    NSMutableArray<NSString *> *a = [NSMutableArray array];
+
+    // ① 自己推导出的 jbroot（最可能对，排最前）
     NSString *jb = FFJbrootPrefix();
     if (jb.length) [a addObject:[jb stringByAppendingString:rel]];
+
+    // ② 其余所有 .jbroot-*（含可能残留的旧目录，顺序靠后不影响正确性）
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSArray<NSString *> *bases = @[
+            @"/var/containers/Bundle/Application",
+            @"/var/mobile/Containers/Shared/AppGroup"
+        ];
+        for (NSString *base in bases) {
+            for (NSString *e in [fm contentsOfDirectoryAtPath:base error:nil]) {
+                if (![e hasPrefix:@".jbroot-"]) continue;
+                NSString *p = [[base stringByAppendingPathComponent:e] stringByAppendingString:rel];
+                if (![a containsObject:p]) [a addObject:p];
+            }
+        }
+    } @catch (NSException *e) {}
+
+    // ③ 真实 rootfs 与 /var/jb 兜底
     [a addObject:rel];
     [a addObject:[@"/var/jb" stringByAppendingString:rel]];
     return a;
@@ -142,18 +175,25 @@ static FF_UNUSED NSString *FFPrefPath(void) {
     return cands.firstObject ?: cands[0];
 }
 
-// 读偏好字典（逐候选尝试）
+// 读偏好字典：逐个候选路径找**确实含本插件开关键**的那份。
+// ⚠️ 不能只取「第一个存在的文件」——残留的旧 jbroot 里可能有一份陈旧副本，
+//    取到它就会读到过期的开关值。以关键键是否存在为准，最后回退到第一个非空。
 static FF_UNUSED NSDictionary *FFReadPrefsDict(void) {
+    NSDictionary *firstNonEmpty = nil;
     for (NSString *p in FFPrefCandidates()) {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
-        if (d.count) return d;
+        if (!d.count) continue;
+        if (!firstNonEmpty) firstNonEmpty = d;
+        if (d[kFFForceFastChargeKey] || d[kFFThermalOverrideKey]) return d;
     }
-    return nil;
+    return firstNonEmpty;
 }
 
 // 写状态文件：供设置页 PSValueCell 从 defaults=com.chargecontrol.<suffix> 域读取。
-// ⚠️ 设置页读的是「jbroot 那份」，所以这里必须写到 jbroot 的 Preferences 目录，
-//    否则设置页永远显示空。按候选顺序写，返回真正落盘的路径（写诊断日志用）。
+// ⚠️ 设置页（被 roothide 重定向到 jbroot）与 powerd（可能直读真实 rootfs）看到的
+//    不是同一个文件，所以这里**把所有候选路径都写一遍**（幂等、代价极小），
+//    保证无论哪一侧、无论 jbroot 推导成功与否，都能读到同一份最新状态。
+//    返回第一个写成功的路径（仅用于诊断日志）。
 static FF_UNUSED NSString *FFWriteDomainPlist(NSString *suffix, NSDictionary *dict) {
     NSString *rel = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.%@.plist",
                      FFPrefDomain, suffix];
@@ -162,12 +202,17 @@ static FF_UNUSED NSString *FFWriteDomainPlist(NSString *suffix, NSDictionary *di
     if (jb.length) [cands addObject:[jb stringByAppendingString:rel]];
     [cands addObject:rel];
     [cands addObject:[@"/var/jb" stringByAppendingString:rel]];
+    NSString *okPath = nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *p in cands) {
         @try {
-            if ([dict writeToFile:p atomically:YES]) return p;
+            // 父目录不存在则先建（jbroot 内的 Preferences 目录在部分场景下可能缺失）
+            [fm createDirectoryAtPath:[p stringByDeletingLastPathComponent]
+          withIntermediateDirectories:YES attributes:nil error:nil];
+            if ([dict writeToFile:p atomically:YES] && !okPath) okPath = p;
         } @catch (NSException *e) {}
     }
-    return nil;
+    return okPath;
 }
 
 // ---------------------------------------------------------------- 诊断日志目录
