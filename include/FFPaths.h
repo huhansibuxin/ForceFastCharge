@@ -37,17 +37,20 @@ static NSString *const FFSettingsChangedNotifName = @"com.chargecontrol/settings
 // 充电状态变化通知（powerd 侧 post，SpringBoard 侧监听以更新指示点）
 static NSString *const FFChargeStateNotifName = @"com.chargecontrol/chargeStateChanged";
 
-// 诊断日志路径（安装/升级时由 postinst 清除，保证每次测试干净开始）
-static NSString *FFLogDir(void) {
+// 注意：设置 bundle 与指示器 target 都 include 本头文件但未必用到每个 helper，
+// Theos 默认 -Werror 会因未使用的 static inline 函数报错，故统一标 unused。
+#define FF_UNUSED __attribute__((unused))
+
+static FF_UNUSED NSString *FFLogDir(void) {
     return @"/var/mobile/ForceFastCharge";
 }
 
-static NSString *FFPrefPath(void) {
+static FF_UNUSED NSString *FFPrefPath(void) {
     return [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", FFPrefDomain];
 }
 
 // 状态标志文件：由 powerd 侧写入，设置页读取并展示「是否真的在生效」
-static NSString *FFStatusPath(void) {
+static FF_UNUSED NSString *FFStatusPath(void) {
     return [FFLogDir() stringByAppendingPathComponent:@"status.plist"];
 }
 
