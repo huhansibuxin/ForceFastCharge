@@ -1,23 +1,54 @@
 //
-//  ForceFastCharge Tweak.xm — 强制快充（单功能版）
+//  ForceFastCharge Tweak.xm — 强制充电（阻止系统断流）
 //
-//  移植自 mowang7426/sbcpu 的 SBCPUPowerd.xm（V3.1.14+ 独立 powerd 目标）。
-//  仅保留「强制快充」一个功能，不含限充 / 温度停充 / 任何 SMC 逻辑。
+//  ⭐ v0.2.0 功能转向（重要，别再往回改）
+//  ────────────────────────────────────────────────────────────────
+//  原定位「强制快充」（吞掉系统的降流写让充电更快）已被实机证据否定：
+//  2026-10-05 在 iPhone 14 Pro Max / iOS 16.6.1 上三重取证 ——
+//   ① 插着充电器 dump 全表 IORegistry：ChargeCurrentLimit / MaxChargeCurrent /
+//      AdapterPowerLimit / AdapterCurrentLimit / ChargingPowerLimit /
+//      ChargingCurrentLimit / USBPD* / Thermal*Limit **命中 0 条**；
+//   ② 把 powerd 本体拉下来解析：__cstring 里电池相关键只有
+//      ChargingOverride / InflowOverride / ChargeInhibit / ChargeLimit /
+//      DisableInflow / ChargingState / InflowState / VacVoltageLimit /
+//      NotChargingReason / ChargerData —— **全是「限/停/只读」，没有一个能提高电流**；
+//   ③ hook 确实挂着（setterCalls=7）但充电期间零命中，全是 boot 期系统键。
+//  ⇒ 上游那套白名单是 macOS/Intel 时代产物，在 iOS 上永远空转。
+//  ⇒ iOS 用户态**只能"限"（停充/限流/限百分比），不能"加"**；充电电流由内核
+//     AppleSmartBatteryManager + SMC 固件决定。故「强制快充」物理上做不到。
 //
-//  设计原则（与上游一致，刻意为之）：
+//  现定位 = **强制充电**：系统想「断流」（停充）时，我们不让它停。
+//  老板原话：「拦截降流这个功能我们就不要了，就只要强制充电，就是不要让它断流就行。」
+//  ────────────────────────────────────────────────────────────────
+//
+//  拦什么（powerd 二进制实证存在、且用于停充的键）：
+//    · ChargeInhibit  = 抑制充电   （true/非0 = 禁止充电）
+//    · DisableInflow  = 禁止流入   （true/非0 = 不充电）
+//    · ChargeBlocked  = 阻断充电   （上游提到过的同族键，一并覆盖）
+//    判定粒度是**值**：只在「朝停充方向」写时吞掉；写 0/false（允许充）一律透传。
+//
+//  不碰什么（刻意护栏）：
+//    · ChargeLimit —— 那是「充电上限百分比」，是用户意图（如设 80%），拦了就是破坏设置；
+//    · FullyCharged / 电量相关 —— 充满了就该停，这是正常行为；
+//    · 温度保护 —— 由内核 SMC 层直接执行，**根本不经过 powerd**，想拦也拦不到
+//      （这反而是好事：我们的拦截不会破坏原厂热保护链）。
+//
+//  设计原则：
 //   1. 只注入 powerd，不碰 thermalmonitord。生命周期 = powerd 生命周期，
 //      powerd 由 launchd 常驻，故装上即一直生效，无需自拉 daemon。
-//   2. 绝不伪造电池状态、绝不改写注册表读回值。
-//   3. 只「吞掉」系统降低充电功率的写指令（返回 KERN_SUCCESS 表示已处理），
-//      不主动把电流顶到某个值。
-//   4. 绝不拦截 ChargeInhibit / ChargeBlocked / ChargeLimit / FullyCharged
-//      以及任何温度安全键——这些是原厂保护链，碰了就是黑屏/烧机。
+//   2. 绝不伪造电池状态、绝不改写注册表读回值、**绝不主动写**任何电池属性。
+//      我们只做「拦截」——事件驱动，零轮询、零主动写盘（老板明确反对 heartbeat）。
+//   3. 覆盖三条写入通道：IORegistryEntrySetCFProperty（单数）、
+//      IORegistryEntrySetCFProperties（复数）、IOServiceSetCFProperty（若存在）。
+//      ⚠️ 复数版正是上游漏掉的那条 —— powerd 的 IOKit imports 里它是存在的。
+//   4. 另 hook IOServiceOpen 做**纯诊断**（记录 powerd 打开了哪些 IO service），
+//      用于判断它是否走 AppleSmartBatteryManagerUserClient（IOConnectCallMethod）通道。
 //
 //  与旧版（ChargeControl/Tweak.xm 激进派）的本质区别：
 //      旧版：把限流值强行顶回「原生满量」，读不到就灌 5000mA(5A) 兜底，
 //            并每 2s 清除 ChargingPaused/ForceDisableCharge/NotChargingReason
-//            等停充标签 → 满流 + 禁停充 → 无视温度 → 触发热保护强制关机（黑屏）。
-//      新版：只阻止系统「往下压」，压到什么值由充电器协商与 BMS 决定。
+//            等停充标签 → 满流 + 禁停充 + **主动反复写** → 触发热保护强制关机（黑屏）。
+//      本版：只在系统**自己发起**停充写入的那一刻拦下，不主动写、不伪造、不反复刷。
 //
 
 #import <Foundation/Foundation.h>
@@ -36,10 +67,9 @@
 #include "FFPaths.h"
 
 static BOOL gForceFastCharge = NO;
-static BOOL gThermalOverride = NO;
 static BOOL gHookInstalled = NO;
 static uint64_t gLastLogNS = 0;
-static int gBlockedCount = 0;     // 累计拦下的降流写次数（历史总量）
+static int gBlockedCount = 0;     // 累计拦下的停充写次数（历史总量）
 static int gSessionBlocked = 0;   // **本次充电会话内**拦下的次数 —— 指示点红/绿的唯一判据
 static int gSetterCalls = 0;      // hook 被调用的总次数（诊断：证明 hook 点到底有没有被 powerd 用到）
 static BOOL gLastCharging = NO;   // 当前充电状态，供状态文件与指示器读取
@@ -104,24 +134,21 @@ static BOOL readBoolPref(NSString *key, BOOL fallback) {
 //    完全对不上 → 设置页永远显示「未加载」。现在写官方域文件（roothide 下位于
 //    jbroot 的 Preferences 目录，正好是设置页读的那份），另存诊断文件供人排查。
 static int  gStatBlocked  = -1;
-static int  gStatSession  = -1;   // 会话计数也要参与节流，否则「刚拦到降流」不会立即落盘
+static int  gStatSession  = -1;   // 会话计数也要参与节流，否则「刚拦到停充」不会立即落盘
 static BOOL gStatCharging = NO;
 static BOOL gStatForce    = NO;
-static BOOL gStatThermal  = NO;   // 温控开关也要参与，否则关掉后状态文件停在旧值
 
 static void writeStatusFile(void) {
     if (!gHookInstalled) return;
     // 节流：2s 定时器会频繁调用本函数，内容没变就不重复写盘（省 IO）
     if (gStatBlocked == gBlockedCount && gStatSession == gSessionBlocked &&
-        gStatCharging == gLastCharging && gStatForce == gForceFastCharge &&
-        gStatThermal == gThermalOverride) {
+        gStatCharging == gLastCharging && gStatForce == gForceFastCharge) {
         return;
     }
     gStatBlocked  = gBlockedCount;
     gStatSession  = gSessionBlocked;
     gStatCharging = gLastCharging;
     gStatForce    = gForceFastCharge;
-    gStatThermal  = gThermalOverride;
 
     NSString *dir = FFLogDir();
     [[NSFileManager defaultManager] createDirectoryAtPath:dir
@@ -132,7 +159,7 @@ static void writeStatusFile(void) {
     NSDictionary *domain = @{
         @"loaded"  : (gHookInstalled ? @"是" : @"否"),
         @"blocked" : [NSString stringWithFormat:@"%d", gBlockedCount],
-        // 「强制快充工作中」= 本次充电会话拦到过降流 —— 指示点红/绿的判据
+        // 「强制充电工作中」= 本次充电会话拦下过系统的停充写 —— 指示点红/绿的判据
         @"active"  : (gSessionBlocked > 0 ? @"工作中" : @"待命"),
     };
     FFWriteDomainPlist(@"ffstatus", domain);
@@ -143,7 +170,6 @@ static void writeStatusFile(void) {
     NSDictionary *st = @{
         @"hookInstalled"     : @(gHookInstalled),
         @"forceEnabled"      : @(gForceFastCharge),
-        @"thermalOverride"   : @(gThermalOverride),
         @"charging"          : @(gLastCharging),
         @"active"            : @(gSessionBlocked > 0),
         @"sessionBlocked"    : @(gSessionBlocked),
@@ -157,20 +183,12 @@ static void writeStatusFile(void) {
 
 static void updateChargeState(void) {
     BOOL enabled = readBoolPref(kFFForceFastChargeKey, NO);
-    BOOL thermal = readBoolPref(kFFThermalOverrideKey, NO);
-    // 温控强制只在主开关打开时才有意义
-    if (!enabled) thermal = NO;
-    if (enabled == gForceFastCharge && thermal == gThermalOverride) {
+    if (enabled == gForceFastCharge) {
         writeStatusFile();
         return;
     }
     gForceFastCharge = enabled;
-    gThermalOverride = thermal;
-    if (gThermalOverride) {
-        logDiag(@"forceFastCharge -> ON (含温控派生键覆盖，风险自负)");
-    } else {
-        logDiag(@"forceFastCharge -> %@", enabled ? @"ON" : @"OFF");
-    }
+    logDiag(@"forceCharge -> %@", enabled ? @"ON（拦停充）" : @"OFF");
     writeStatusFile();
     // 开关变化 → 通知 SpringBoard 侧立即刷新指示点
     notify_post(FFChargeStateNotifName.UTF8String);
@@ -217,77 +235,76 @@ static void pollChargeState(void) {
 }
 
 // ---------------------------------------------------------------- 属性分类
-// A 类：系统软件层降流键 —— 主开关打开即吞掉（安全，不碰温度保护链）
-static BOOL isFastChargeProperty(CFStringRef propertyName) {
+// 「停充键」= 系统用来断流的属性名。
+// 实证来源：powerd 二进制 __cstring 里 `ChargeInhibit` / `DisableInflow` 明确存在
+//（两者在字符串表里紧邻，同属电源断言/充电控制那组键）；`ChargeBlocked` 是上游
+// 注释里提到的同族键，一并覆盖以防不同机型用别的名字。
+static BOOL isStopChargingKey(CFStringRef propertyName) {
     if (!propertyName) return NO;
-    NSString *s = (__bridge NSString *)propertyName;
+    NSString *s = nil;
+    @try { s = [(__bridge NSString *)propertyName lowercaseString]; }
+    @catch (NSException *e) { return NO; }
+    if (!s.length) return NO;
     static NSArray<NSString *> *names;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         names = @[
-            @"ChargeCurrentLimit",
-            @"MaxChargeCurrent",
-            @"AdapterPowerLimit",
-            @"AdapterCurrentLimit",
-            @"ChargingPowerLimit",
-            @"ChargingCurrentLimit",
-            @"USBPDCurrentLimit",
-            @"USBPDPowerLimit"
+            @"chargeinhibit",     // 抑制充电
+            @"disableinflow",     // 禁止流入
+            @"chargeblocked"      // 阻断充电（同族，保险位）
         ];
     });
     for (NSString *name in names) {
-        if ([s caseInsensitiveCompare:name] == NSOrderedSame ||
-            [s rangeOfString:name options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return YES;
-        }
+        // 精确匹配，不用包含匹配：这几个词太短，包含匹配会误伤 ChargeInhibitReasons
+        // 之类的只读状态键。
+        if ([s isEqualToString:name]) return YES;
     }
     return NO;
 }
 
-// B 类：温控派生的降流键 —— 这正是「高温时系统原生拒绝充电」的那一层。
-//      默认【放行】，只有用户显式打开「高温强制」才吞。
-//      ⚠️ 吞掉这层等于无视原厂热保护，设备将不再自行停止充电，
-//         有过热强制关机（黑屏）与电池老化风险。
-static BOOL isThermalLimitProperty(CFStringRef propertyName) {
-    if (!propertyName) return NO;
-    NSString *s = (__bridge NSString *)propertyName;
-    static NSArray<NSString *> *names;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        names = @[
-            @"ThermalMaxChargeCurrent",
-            @"ThermalChargingLimit",
-            @"ThermalChargeCurrentLimit",
-            @"ThermalAdapterCurrentLimit"
-        ];
-    });
-    for (NSString *name in names) {
-        if ([s caseInsensitiveCompare:name] == NSOrderedSame ||
-            [s rangeOfString:name options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return YES;
+// 值判定：只有「朝停充方向」写才拦（true / 非 0）。
+// ⚠️ 这一层不能省 —— 系统同样会写 ChargeInhibit=false 来**解除**停充（恢复充电），
+//    那种写入对我们有利，拦了反而害事，必须原样放行。
+static BOOL isStopValue(CFTypeRef v) {
+    if (!v) return NO;
+    @try {
+        CFTypeID t = CFGetTypeID(v);
+        if (t == CFBooleanGetTypeID()) return CFBooleanGetValue((CFBooleanRef)v);
+        if (t == CFNumberGetTypeID()) {
+            long long n = 0;
+            if (CFNumberGetValue((CFNumberRef)v, kCFNumberLongLongType, &n)) return n != 0;
+            return NO;
         }
-    }
+        if (t == CFStringGetTypeID()) {
+            NSString *s = [(__bridge NSString *)v lowercaseString];
+            return [s isEqualToString:@"true"] || [s isEqualToString:@"yes"] ||
+                   [s integerValue] != 0;
+        }
+    } @catch (NSException *e) {}
     return NO;
 }
 
 // 总判定：当前设置下，这个写操作是否应该被吞掉
-static BOOL shouldBlockWrite(CFStringRef propertyName) {
+static BOOL shouldBlockWrite(CFStringRef propertyName, CFTypeRef value) {
     if (!gForceFastCharge) return NO;
-    if (isThermalLimitProperty(propertyName)) return gThermalOverride;  // 需二次开关
-    return isFastChargeProperty(propertyName);
+    return isStopChargingKey(propertyName) && isStopValue(value);
 }
 
 // ---------------------------------------------------------------- Hook
 typedef kern_return_t (*IORegistryEntrySetCFPropertyFn)(io_registry_entry_t, CFStringRef, CFTypeRef);
+typedef kern_return_t (*IORegistryEntrySetCFPropertiesFn)(io_registry_entry_t, CFTypeRef);
 typedef kern_return_t (*IOServiceSetCFPropertyFn)(io_service_t, CFStringRef, CFTypeRef);
+typedef kern_return_t (*IOServiceOpenFn)(io_service_t, task_port_t, uint32_t, io_connect_t *);
 
-static IORegistryEntrySetCFPropertyFn orig_SetCFProp = NULL;
-static IOServiceSetCFPropertyFn orig_SvcSetCFProp = NULL;
+static IORegistryEntrySetCFPropertyFn   orig_SetCFProp   = NULL;
+static IORegistryEntrySetCFPropertiesFn orig_SetCFProps  = NULL;
+static IOServiceSetCFPropertyFn         orig_SvcSetCFProp = NULL;
+static IOServiceOpenFn                  orig_SvcOpen     = NULL;
 
 // 记账：证明 hook 到底有没有被 powerd 用到，以及它都写了哪些键。
 // 为什么必须有它：只看 blockedWriteCount==0 无法区分两种情况 ——
-//   ① powerd 压根没调用这个 setter（hook 点不对）
-//   ② 调用了，但键名不在白名单里（白名单该扩）
+//   ① powerd 压根没调用这些 setter（hook 点不对）
+//   ② 调用了，但键名不在停充键表里（那就该扩表）
 // 打出「总调用数 + 出现过的键名（去重，上限 48 个）」就能一眼分辨。
 static void noteSetterCall(CFStringRef propertyName) {
     gSetterCalls++;
@@ -306,44 +323,107 @@ static void noteSetterCall(CFStringRef propertyName) {
     }
 }
 
-// 只在开关打开时吃掉降流写；其余一律原样透传给系统
+// 命中一次「停充写」→ 记账 + （本会话首次时）立即落盘并通知 SpringBoard 翻红。
+// ⚠️ 本函数只负责「记账 + 通知」，不参与是否拦截的判定（那由 shouldBlockWrite 决定）。
+static void recordStopWrite(NSString *where, CFStringRef propertyName) {
+    gBlockedCount++;
+    BOOL firstInSession = (gSessionBlocked == 0);
+    gSessionBlocked++;
+    logThrottled(@"BLOCK stop-charge(%@): %@ (total=%d, session=%d)",
+                 where, (__bridge NSString *)propertyName, gBlockedCount, gSessionBlocked);
+    if (firstInSession) {
+        // 状态从「待命」翻成「工作中」→ 立即落盘并通知 SpringBoard 翻红
+        writeStatusFile();
+        notify_post(FFChargeStateNotifName.UTF8String);
+    }
+}
+
+// 单数版：一次写一个属性。只在开关打开、且键与值都指向「停充」时才吞。
 static kern_return_t hook_SetCFProperty(io_registry_entry_t entry,
                                         CFStringRef propertyName,
                                         CFTypeRef property) {
     noteSetterCall(propertyName);
-    if (shouldBlockWrite(propertyName)) {
-        gBlockedCount++;
-        BOOL firstInSession = (gSessionBlocked == 0);
-        gSessionBlocked++;
-        logThrottled(@"blocked down-limit write: %@ (total=%d, session=%d)",
-                     (__bridge NSString *)propertyName, gBlockedCount, gSessionBlocked);
-        if (firstInSession) {
-            // 状态从「待命」翻成「工作中」→ 立即落盘并通知 SpringBoard 翻红
-            writeStatusFile();
-            notify_post(FFChargeStateNotifName.UTF8String);
-        }
-        return KERN_SUCCESS;   // 告诉系统「已处理」，实际不写入 → 系统无法把上限压低
+    if (shouldBlockWrite(propertyName, property)) {
+        recordStopWrite(@"set", propertyName);
+        return KERN_SUCCESS;   // 告诉系统「已处理」，实际不写入 → 系统没能断流
     }
     return orig_SetCFProp ? orig_SetCFProp(entry, propertyName, property) : KERN_FAILURE;
 }
 
+// ⭐ 复数版：一次写一批属性（CFDictionary）。
+// 上游 SBCPUPowerd.xm **只 hook 了单数版**，而 powerd 的 IOKit imports 里
+// `_IORegistryEntrySetCFProperties` 是存在的 —— 这正是此前「hook 挂着却零命中」
+// 的候选漏网通道。做法：把批次里的停充键剔除，剩下的原样透传；
+// 若整批都是停充键 → 直接 return KERN_SUCCESS（整批吞掉）。
+static kern_return_t hook_SetCFProperties(io_registry_entry_t entry, CFTypeRef properties) {
+    if (!gForceFastCharge || !properties ||
+        CFGetTypeID(properties) != CFDictionaryGetTypeID()) {
+        return orig_SetCFProps ? orig_SetCFProps(entry, properties) : KERN_FAILURE;
+    }
+    NSDictionary *dict = (__bridge NSDictionary *)properties;
+    NSMutableDictionary *kept = [NSMutableDictionary dictionary];
+    BOOL blockedAny = NO;
+    for (id k in dict) {
+        @try {
+            NSString *key = [k isKindOfClass:[NSString class]] ? (NSString *)k : [k description];
+            if (!key.length) { kept[k] = dict[k]; continue; }
+            CFStringRef kcf = (__bridge CFStringRef)key;
+            noteSetterCall(kcf);
+            if (shouldBlockWrite(kcf, (__bridge CFTypeRef)dict[k])) {
+                blockedAny = YES;
+                recordStopWrite(@"setprops", kcf);
+            } else {
+                kept[k] = dict[k];      // 非停充键 → 原样保留
+            }
+        } @catch (NSException *e) {}
+    }
+    if (!blockedAny) {
+        return orig_SetCFProps ? orig_SetCFProps(entry, properties) : KERN_FAILURE;
+    }
+    if (kept.count == 0) return KERN_SUCCESS;    // 整批都是停充键 → 整批吞掉
+    return orig_SetCFProps ? orig_SetCFProps(entry, (__bridge CFTypeRef)kept) : KERN_FAILURE;
+}
+
+// service 版（本机 IOKit 里可能根本没有这个符号，取不到就跳过，不算失败）
 static kern_return_t hook_SvcSetCFProperty(io_service_t service,
                                            CFStringRef propertyName,
                                            CFTypeRef property) {
     noteSetterCall(propertyName);
-    if (shouldBlockWrite(propertyName)) {
-        gBlockedCount++;
-        BOOL firstInSession = (gSessionBlocked == 0);
-        gSessionBlocked++;
-        logThrottled(@"blocked down-limit write(svc): %@ (total=%d, session=%d)",
-                     (__bridge NSString *)propertyName, gBlockedCount, gSessionBlocked);
-        if (firstInSession) {
-            writeStatusFile();
-            notify_post(FFChargeStateNotifName.UTF8String);
-        }
+    if (shouldBlockWrite(propertyName, property)) {
+        recordStopWrite(@"svc", propertyName);
         return KERN_SUCCESS;
     }
     return orig_SvcSetCFProp ? orig_SvcSetCFProp(service, propertyName, property) : KERN_FAILURE;
+}
+
+// 纯诊断：记录 powerd 打开了哪些 IO service（去重、上限 64）。
+// 目的：判断它是否走 `AppleSmartBatteryManagerUserClient`（IOConnectCallMethod）那
+// 条通道。那条通道我们**只观测不拦截** —— externalMethod 的参数结构未知，
+// 盲拦有把电池通信搞坏的风险；等日志证明确实用它，再决定要不要动。
+static kern_return_t hook_IOServiceOpen(io_service_t service, task_port_t owningTask,
+                                        uint32_t type, io_connect_t *connect) {
+    kern_return_t kr = orig_SvcOpen ? orig_SvcOpen(service, owningTask, type, connect)
+                                    : KERN_FAILURE;
+    if (kr == KERN_SUCCESS) {
+        @try {
+            io_name_t cls = {0};
+            if (IOObjectGetClass(service, cls) == KERN_SUCCESS && cls[0]) {
+                static NSMutableSet<NSString *> *seen = nil;
+                static dispatch_once_t once;
+                dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+                NSString *n = [NSString stringWithUTF8String:cls];
+                if (n.length) {
+                    @synchronized (seen) {
+                        if (seen.count < 64 && ![seen containsObject:n]) {
+                            [seen addObject:n];
+                            logDiag(@"IO service opened: %@", n);
+                        }
+                    }
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+    return kr;
 }
 
 static void installIOKitHooks(void) {
@@ -357,11 +437,22 @@ static void installIOKitHooks(void) {
     if (p1 && !orig_SetCFProp) {
         MSHookFunction(p1, (void *)hook_SetCFProperty, (void **)&orig_SetCFProp);
     }
+    // ⭐ 上游漏掉的复数版通道
+    void *p1b = dlsym(handle, "IORegistryEntrySetCFProperties");
+    if (p1b && !orig_SetCFProps) {
+        MSHookFunction(p1b, (void *)hook_SetCFProperties, (void **)&orig_SetCFProps);
+    }
     void *p2 = dlsym(handle, "IOServiceSetCFProperty");
     if (p2 && !orig_SvcSetCFProp) {
         MSHookFunction(p2, (void *)hook_SvcSetCFProperty, (void **)&orig_SvcSetCFProp);
     }
-    gHookInstalled = (orig_SetCFProp != NULL || orig_SvcSetCFProp != NULL);
+    // 诊断用：只记录，不改行为
+    void *p3 = dlsym(handle, "IOServiceOpen");
+    if (p3 && !orig_SvcOpen) {
+        MSHookFunction(p3, (void *)hook_IOServiceOpen, (void **)&orig_SvcOpen);
+    }
+    gHookInstalled = (orig_SetCFProp != NULL || orig_SetCFProps != NULL ||
+                      orig_SvcSetCFProp != NULL);
 }
 
 // Darwin 通知回调（CFNotificationCenter 形态，对齐上游 SBCPUPowerd.xm 签名）
@@ -411,8 +502,9 @@ static void settingsChanged(CFNotificationCenterRef center, void *observer,
             logDiag(@"no IOKit setter hooks installed");
             return;
         }
-        logDiag(@"hooks installed (SetCFProperty=%d, SvcSetCFProperty=%d)",
-                orig_SetCFProp != NULL, orig_SvcSetCFProp != NULL);
+        logDiag(@"hooks installed (set=%d, setProps=%d, svcSet=%d, svcOpen=%d)",
+                orig_SetCFProp != NULL, orig_SetCFProps != NULL,
+                orig_SvcSetCFProp != NULL, orig_SvcOpen != NULL);
         writeStatusFile();
 
         // 监听设置变更与充电状态变化（Darwin 通知中心，与上游一致）

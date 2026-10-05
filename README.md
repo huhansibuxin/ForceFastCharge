@@ -1,47 +1,55 @@
 # ForceFastCharge
 
-强制快充**单功能**版越狱插件。仅注入 `powerd`，阻止系统把充电电流/功率上限往下压。
+**强制充电**单功能版越狱插件。仅注入 `powerd`：系统尝试停充（断流）时，拦下这次写入，让它继续充到满。
 
-移植自 [`mowang7426/sbcpu`](https://github.com/mowang7426/sbcpu) 的 `SBCPUPowerd.xm`（V3.1.14+ 独立 powerd 目标），剥离全部限充 / 温度停充 / AppleSMC 逻辑，只保留强制快充一项。
+> ⚠️ **v0.2.0 功能转向**：本插件原来做的是「强制快充」（吞掉系统的降流写，让充电更快）。
+> 该方向已被实机证据否定，现改为**强制充电**（阻止系统断流）。原因见下一节。
+
+## 为什么不做「强制快充」了
+
+2026-10-05 在 iPhone 14 Pro Max / iOS 16.6.1（20G81）上做了三重取证：
+
+| # | 证据 | 结果 |
+|---|---|---|
+| ① | 插着充电器（`ExternalConnected=Yes` / `IsCharging=Yes`）dump 全表 IORegistry（23872 行） | `ChargeCurrentLimit` / `MaxChargeCurrent` / `AdapterPowerLimit` / `AdapterCurrentLimit` / `ChargingPowerLimit` / `ChargingCurrentLimit` / `USBPD*` / `Thermal*Limit` —— **命中 0 条** |
+| ② | 把 `powerd` 本体（`/System/Library/CoreServices/powerd.bundle/powerd`）拉下来解析 `__cstring` | 电池相关键只有 `ChargingOverride` / `InflowOverride` / `ChargeInhibit` / `ChargeLimit` / `DisableInflow` / `ChargingState` / `InflowState` / `VacVoltageLimit` / `NotChargingReason` / `ChargerData` —— **全是「限 / 停 / 只读」，没有一个能提高电流** |
+| ③ | 看运行时 hook 日志 | `setterCalls = 7`，全是 boot 期的系统键（TimeZoneOffsetSeconds / SleepWakeUUID / …），充电期间**零命中** |
+
+**结论**：上游 `SBCPUPowerd.xm` 那套白名单是 macOS / Intel 时代的键名，在 iOS 上不存在 ⇒ 该插件**永远空转**，不是代码写错。
+
+更根本的是：**iOS 用户态只能「限」（停充 / 限流 / 限百分比），不能「加」** —— 充电电流由内核 `AppleSmartBatteryManager` + 电池管理芯片（SMC）固件决定。所以「让充电更快」物理上做不到；**「不让它中断」可以做到**，这就是本插件现在的功能。
 
 ## 设计原则
 
 1. **只注入 `powerd`** —— 生命周期 = powerd 生命周期。powerd 由 launchd 常驻，故装上即一直生效，**不需要自拉 daemon**。
-2. **不伪造电池状态、不改写注册表读回值**。
-3. **只「吞掉」降流写指令**（命中白名单键时 `return KERN_SUCCESS`，实际不写入），不主动把电流顶到某个值。
-4. **默认不拦截温度安全键**。
+2. **不伪造电池状态、不改写注册表读回值、不主动写任何属性** —— 只在系统**自己发起**停充写入的那一刻拦一下（事件驱动，零轮询、零主动写盘）。
+3. **只拦「停充方向」的写入** —— 系统同样会写 `ChargeInhibit = false` 来**解除**停充，那种写入对我们有利，原样放行。
+4. **不碰 `ChargeLimit`**（充电上限百分比，那是用户意图）、**不碰 `FullyCharged` / 电量**（充满了就该停）。
+5. **拦不到内核热保护** —— 温度保护由内核 SMC 层直接执行，**根本不经过 powerd**，想拦也拦不到。这反而是好事：我们的拦截不会破坏原厂热保护链。
 
-## 两个开关
+## 一个开关
 
 | 开关 | 偏好键 | 默认 | 作用 |
 |---|---|---|---|
-| 强制快充 | `forceChargeEnabled` | `false` | 吞掉**系统软件层**降流键（`ChargeCurrentLimit` / `MaxChargeCurrent` / `AdapterPowerLimit` / `AdapterCurrentLimit` / `ChargingPowerLimit` / `ChargingCurrentLimit` / `USBPDCurrentLimit` / `USBPDPowerLimit`）。安全档。 |
-| 强制覆盖温控降流 | `forceThermalOverrideEnabled` | `false` | 额外吞掉**温控派生**键（`ThermalMaxChargeCurrent` / `ThermalChargingLimit` / `ThermalChargeCurrentLimit` / `ThermalAdapterCurrentLimit`）。⚠️ **高风险** |
+| 强制充电（不断流） | `forceChargeEnabled` | `false` | 系统写 `ChargeInhibit` / `DisableInflow` / `ChargeBlocked`（值为 true / 非 0）时拦下该写入，让它继续充 |
 
-### 为什么温控要单独一个开关
-
-机身过热时，iOS 是通过 `ThermalMaxChargeCurrent` 这类**温控派生键**停止充电的——这就是「高温时系统原生不允许」。这属于原厂安全保护链。
-
-- 旧版 CPUthermal 把温控键**也列进拦截白名单**，等于无视热保护 → 满流充且不自停 → 越过临界温度 → **thermal force-shutdown（黑屏）**。
-- 本插件**默认放行**温控键，所以只开「强制快充」不会触发该路径。
-- 只有你显式打开第二个开关才会覆盖温控，此时需自行承担过热强制关机与电池老化风险。
+覆盖三条写入通道：`IORegistryEntrySetCFProperty`（单数）、`IORegistryEntrySetCFProperties`（**复数版，上游漏掉的那条**）、`IOServiceSetCFProperty`（本机 IOKit 无此符号时自动跳过）。另 hook `IOServiceOpen` 做纯诊断（记录 powerd 打开了哪些 IO service）。
 
 ## 状态指示点（圆点）
 
-> **圆点的唯一作用：判断强制快充到底有没有在起作用。** 所以默认模式就是「仅强制」——
-> 只有一个判断点：我们真在干活（拦到系统降流）才亮红点。其余情况一律不显示。
+> **红点 = 我们强制让它充**（拦下了系统的停充写，正在阻止断流）。
+> **绿点 = 电池自己的颜色**（系统原生充电，我们没介入）。
+> 不充电时两个模式都不显示。
 
-判据**不是**「强制快充开关开没开」（本插件的用法是常开），而是
-**这一轮充电里我们有没有真的拦到系统降流**（powerd 侧 `sessionBlocked > 0`）。
+判据**不是**「开关开没开」（本插件的用法是常开），而是
+**这一轮充电里我们有没有真的拦下系统停充**（powerd 侧 `sessionBlocked > 0`）。
 每次开始充电会话时该计数会自动重置。
 
 | 模式 | 值 | 行为 |
 |---|---|---|
-| **仅强制**（默认） | `2` | 只有我们真在拦降流时才显示 🔴 红点；我们没干活就不显示 |
-| 常显 | `1` | 只要在充电就显示：🟢 绿 = 系统原生充电（我们没介入）；🔴 红 = 我们在拦降流 |
+| **仅强制**（默认） | `2` | 只有我们真在阻止断流时才显示 🔴 红点；没干活就不显示 |
+| 常显 | `1` | 只要在充电就显示：🟢 绿 = 系统自己在充；🔴 红 = 我们在阻止断流 |
 
-- **不充电时两个模式都不显示**（拔线即消失）。
-- 颜色只有两个：**绿 = 系统自己就充得很好、我们无事可做**；**红 = 强制快充确实在干活**。
 - 位置由设置页的 `dotX` / `dotY` 决定（默认 X=294 Y=29.4，灵动岛右侧）。
 - 实现：独立 `UIWindow` + `windowLevel = UIWindowLevelAlert + 1.0`，`userInteractionEnabled = NO`，
   窗口只占 24×24，不接收触摸、不影响手势。
@@ -54,48 +62,50 @@
 
 | 行 | 数据源 | 含义 |
 |---|---|---|
-| powerd 已加载 | `com.chargecontrol.ffstatus` 域 `loaded` | `是` = dylib 已注入 powerd 且 hook 装好；`否` = 未注入或未重启 powerd |
-| 强制快充是否在干活 | `com.chargecontrol.ffstatus` 域 `active` | `工作中` = 本轮充电拦到过降流（**红点判据**）；`待命` = 还没拦到 |
-| 已拦截降流次数 | `com.chargecontrol.ffstatus` 域 `blocked` | 启动至今被拦下的降流写次数，**数值持续增长即代表确实在拦截生效** |
+| powerd 已加载 | `com.chargecontrol.ffstatus` 域 `loaded` | `是` = dylib 已注入 powerd 且 hook 装好 |
+| 强制充电是否在干活 | `com.chargecontrol.ffstatus` 域 `active` | `工作中` = 本轮充电拦下过停充（**红点判据**）；`待命` = 还没拦到 |
+| 已拦截停充次数 | `com.chargecontrol.ffstatus` 域 `blocked` | 启动至今被拦下的停充写次数，**持续增长即代表确实在拦截** |
 | 指示器已加载 | `com.chargecontrol.sbstatus` 域 `dotLoaded` | `是` = 指示点 target 已注入 SpringBoard |
 | 圆点窗口 | `com.chargecontrol.sbstatus` 域 `dotWindow` | `是` = 指示点 UIWindow 已挂到屏幕 |
-| 圆点当前状态 | `com.chargecontrol.sbstatus` 域 `dotState` | 此刻圆点应该是什么样（`红 · 强制快充工作中` / `绿 · 系统原生充电` / `不显示`），不必盯着状态栏核对 |
+| 圆点当前状态 | `com.chargecontrol.sbstatus` 域 `dotState` | 此刻圆点应该是什么样（`红 · 正阻止系统断流` / `绿 · 系统原生充电` / `不显示`） |
 
 > ⚠️ roothide 隐根下设置页读写 `/var/mobile/Library/Preferences/` 会被自动重定向到 jbroot 内的同名路径，
 > 而注入系统进程的 dylib 直读直写真实路径。本插件已内置 jbroot 自定位（`FFJbrootPrefix`，dladdr 反推 + 目录扫描 + `/var/jb` 三级回退），
-> 并把**所有候选路径都写一遍**，保证两边落到同一个文件——这是 v0.1.3 修复「设置页永远显示未加载」的关键。
+> 并把**所有候选路径都写一遍**，保证两边落到同一个文件。
 
 ### 排查「圆点一直不红」：先看 hook 有没有被调用
 
-`ffcharge.log` 里的 `setter key seen: <键名>` 与 `ff_status.plist` 的 `setterCalls` 是专门为此加的：
+`ffcharge.log` 里的 `setter key seen: <键名>`、`IO service opened: <类名>` 与 `ff_status.plist` 的 `setterCalls` 是专门为此加的：
 
-- `setterCalls == 0` → powerd **压根没调用**我们 hook 的 setter ⇒ hook 点不对（不是白名单问题）；
-- `setterCalls > 0` 且 `blockedWriteCount == 0` → 调了，但**键名没命中白名单**，需要扩白名单；
+- `setterCalls == 0` → powerd **压根没调用**我们 hook 的 setter ⇒ hook 点不对；
+- `setterCalls > 0` 且 `blockedWriteCount == 0` → 调了，但**没有停充方向的写入**（＝系统本来就没断流，圆点不该红，属正常）；
 - `blockedWriteCount > 0` → 拦截链通了，圆点该是红的。
+- `IO service opened:` 里若出现 `AppleSmartBatteryManagerUserClient`，说明 powerd 还走用户客户端通道
+  （`IOConnectCallMethod`）——该通道目前**只观测不拦截**（externalMethod 参数结构未知，盲拦有风险）。
 
 ## 与旧版（ChargeControl 激进派）的区别
 
-| | 旧版 `ChargeControl/Tweak.xm` | 本插件（默认档） |
+| | 旧版 `ChargeControl/Tweak.xm` | 本插件 |
 |---|---|---|
 | 注入 | powerd + thermalmonitord | **仅 powerd** |
-| 降流处理 | 强行顶回「原生满量」，读不到灌 **5000mA(5A)** | **直接吞掉写请求**，不改值 |
-| 停充标签 | 每 2s 清 `ChargingPaused`/`ForceDisableCharge`/`NotChargingReason`/优化位 | **完全不碰** |
-| 温控派生键 | 一并拦截 | **默认放行**（需单独开关） |
-| 电池状态 | 改写读回值 | **不伪造** |
+| 触发方式 | 常驻改写 + **每 2s 主动清**停充标签 | **只在系统发起写入时拦一下**（事件驱动） |
+| 电池状态 | 改写读回值 | **不伪造、不主动写** |
+| 温度保护 | 一并拦截 | **拦不到也碰不到**（走内核，不经过 powerd） |
 
-> 旧版黑屏根因：满流充 + 禁停充 + 无视温控 → 温度只升不降 → 越过临界值 → iOS thermal force-shutdown。
-> 本插件默认档从设计上不会触发该路径。
+> 旧版黑屏根因：满流充 + 禁停充 + 无视温控 + 主动反复写 → 温度只升不降 → 越过临界值 → iOS thermal force-shutdown。
+> 本插件从设计上不会触发该路径。
 
-## 实际效果边界
+## 实际效果边界与风险
 
-充电速度最终由**充电器额定功率、线材规格、电池 BMS 与机身温度**共同决定。本插件只保证「系统不主动往下压电流上限」，无法突破充电器功率天花板，也**无法绕过高温时的降流保护**（除非开启高风险开关）。
+- 本插件**不能**让充电更快（见开头三铁证）；只能做到「系统想中断时不中断」。
+- ⚠️ **风险提示**：若停充源于机身过热，强行继续充会加速电池老化。是否使用请自行权衡。
+- 若系统停充是内核直接执行的（不经过用户态），插件拦不到 —— 此时红点不会亮，也不会造成任何影响。
 
 ## 偏好键
 
 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `forceChargeEnabled` | Bool | `false` | 强制快充主开关 |
-| `forceThermalOverrideEnabled` | Bool | `false` | 高温强制（高风险） |
+| `forceChargeEnabled` | Bool | `false` | 强制充电主开关 |
 | `indicatorShowMode` | Int | `2` | 圆点模式：`2` 仅强制（默认，只有我们干活才亮红）；`1` 常显（充电就显示，绿/红） |
 | `dotX` / `dotY` | String | `294` / `29.4` | 圆点中心坐标（pt） |
 
@@ -109,7 +119,7 @@
 | 文件 | 写入者 | 内容 |
 |---|---|---|
 | `boot.log` | 两个 dylib 的 `%ctor` 第一行（纯 POSIX，不依赖 ObjC） | 加载痕迹：`path/pid/progname`，用于区分「ctor 没跑」与「写盘被拒」 |
-| `ffcharge.log` | powerd 侧 | hook 安装、每次拦截的降流键 |
+| `ffcharge.log` | powerd 侧 | hook 安装、每次拦截的停充键、`setter key seen`、`IO service opened` |
 | `ff_status.plist` | powerd 侧 | powerd 侧状态诊断副本 |
 | `sb.log` | SpringBoard 侧 | 指示点创建、刷新、定时器心跳 |
 | `sb_status.plist` | SpringBoard 侧 | 指示点状态诊断副本 |

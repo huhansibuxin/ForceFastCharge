@@ -27,9 +27,8 @@
 #import "FFPaths.h"
 
 static BOOL gLastForce    = NO;
-static BOOL gLastThermal  = NO;
 static BOOL gLastCharging = NO;
-static BOOL gLastActive   = NO;   // 上一轮「我们有没有在拦降流」，纳入变化检测
+static BOOL gLastActive   = NO;   // 上一轮「我们有没有拦下系统停充」，纳入变化检测
 static NSInteger gLastMode = -1;
 static CGFloat gLastX = -1, gLastY = -1;   // 坐标也要纳入变化检测，否则改坐标不生效
 static BOOL gEnabled      = NO;   // 是否成功进入运行态
@@ -126,8 +125,8 @@ static BOOL readCharging(void) {
     return NO;
 }
 
-// 「我们的强制快充这一轮有没有真的在干活」= powerd 侧 sessionBlocked > 0。
-// ⚠️ 判据不是「开关开没开」（老板的开关是常开的），而是「有没有真拦到系统降流」。
+// 「我们的强制充电这一轮有没有真的在干活」= powerd 侧 sessionBlocked > 0。
+// ⚠️ 判据不是「开关开没开」（老板的开关是常开的），而是「有没有真拦下系统的停充写」。
 //    powerd 把结果写进 ff_status.plist 的 active 字段（root:wheel 0644，SB 可读）。
 static BOOL readForceActive(void) {
     @try {
@@ -157,7 +156,7 @@ static void writeSbStatus(CGFloat cx, CGFloat cy) {
         visible = YES;
     }
     if (!visible)             dotState = @"不显示";
-    else if (gLastActive)     dotState = @"红 · 强制快充工作中";
+    else if (gLastActive)     dotState = @"红 · 正阻止系统断流";
     else                      dotState = @"绿 · 系统原生充电";
 
     // ① 设置页读的域文件（键名必须与 Root.plist 的 key 逐字一致：
@@ -174,7 +173,6 @@ static void writeSbStatus(CGFloat cx, CGFloat cy) {
         @"loaded"        : @(gEnabled),
         @"windowCreated" : @([FFIndicator windowCreated]),
         @"force"         : @(gLastForce),
-        @"thermal"       : @(gLastThermal),
         @"charging"      : @(gLastCharging),
         @"active"        : @(gLastActive),
         @"dotState"      : dotState,
@@ -191,26 +189,24 @@ static void writeSbStatus(CGFloat cx, CGFloat cy) {
 // ---------------------------------------------------------------- 刷新驱动
 static void refreshIndicator(BOOL forceNotify) {
     BOOL force    = readBool(kFFForceFastChargeKey, NO);
-    BOOL thermal  = readBool(kFFThermalOverrideKey, NO);
-    if (!force) thermal = NO;
     BOOL charging = readCharging();
-    BOOL active   = readForceActive();     // 我们这一轮充电有没有真拦到降流 → 决定红/绿
+    BOOL active   = readForceActive();     // 我们这一轮充电有没有真拦下系统停充 → 决定红/绿
     NSInteger mode = readInt(kFFIndicatorModeKey, kFFShowModeForceOnly);
     CGFloat cx = readDouble(kFFDotXKey, kFFDotXDefault);
     CGFloat cy = readDouble(kFFDotYKey, kFFDotYDefault);
 
-    BOOL changed = (force != gLastForce) || (thermal != gLastThermal) ||
+    BOOL changed = (force != gLastForce) ||
                    (charging != gLastCharging) || (active != gLastActive) ||
                    (mode != gLastMode) || (cx != gLastX) || (cy != gLastY);
 
-    gLastForce = force; gLastThermal = thermal;
+    gLastForce = force;
     gLastCharging = charging; gLastActive = active;
     gLastMode = mode; gLastX = cx; gLastY = cy;
 
     if (!forceNotify && !changed) return;   // 无变化不打扰
 
-    sbLog(@"refresh force=%d thermal=%d charging=%d active=%d mode=%ld coord=(%.1f,%.1f) win=%d",
-          force, thermal, charging, active, (long)mode, cx, cy, [FFIndicator windowCreated]);
+    sbLog(@"refresh force=%d charging=%d active=%d mode=%ld coord=(%.1f,%.1f) win=%d",
+          force, charging, active, (long)mode, cx, cy, [FFIndicator windowCreated]);
 
     [[FFIndicator shared] updateWithCharging:charging active:active mode:mode];
     writeSbStatus(cx, cy);

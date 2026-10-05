@@ -3,27 +3,31 @@
 <plist version="1.0">
 <dict>
 	<key>title</key>
-	<string>强制快充</string>
+	<string>强制充电</string>
 	<key>items</key>
 	<array>
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
-			<key>label</key><string>强制快充</string>
-			<key>footerText</key><string>阻止系统把充电电流/功率上限往下压（ChargeCurrentLimit、MaxChargeCurrent、AdapterPowerLimit、USBPD* 等），让充电速度由充电器协商与电池 BMS 决定。不修改电池状态、不解除原厂温度保护。</string>
+			<key>label</key><string>强制充电（阻止系统断流）</string>
+			<key>footerText</key><string>系统有时会（温度偏高、充电策略判定等）把充电电流降到 0mA，也就是「断流」。打开下面的开关后，一旦系统尝试停充，本插件会拦下这次写入，让它继续充到满。</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSSwitchCell</string>
 			<key>default</key><false/>
 			<key>defaults</key><string>com.chargecontrol</string>
 			<key>key</key><string>forceChargeEnabled</string>
-			<key>label</key><string>强制快充</string>
+			<key>label</key><string>强制充电（不断流）</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSGroupCell</string>
+			<key>footerText</key><string>工作原理：只拦「停充」这一类写入（ChargeInhibit / DisableInflow），不伪造电池读数、不修改电量、不主动写任何属性，也不碰「充电上限百分比」。若系统停充是由内核热保护直接执行的（不经过用户态），插件拦不到 —— 那时红点不会亮，也不会造成任何影响。</string>
 		</dict>
 
 		<!-- ===================== 指示点 ===================== -->
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
 			<key>label</key><string>状态指示点</string>
-			<key>footerText</key><string>圆点的唯一作用：判断强制快充到底有没有在起作用 —— 我们真在拦系统降流时亮红点。绿点 = 系统原生充电（我们没介入，系统自己就充得很好），不充电时一律不显示。判据不是「开关开没开」（开关常开），而是「这一轮充电有没有真的拦到降流」。圆点只覆盖自身 24×24 区域、不接收触摸，不影响系统手势。</string>
+			<key>footerText</key><string>红点 = 我们强制让它充 —— 拦下了系统的停充写、正在阻止断流（插件真的在干活）。绿点 = 电池自己的颜色 —— 系统原生充电，我们没介入。不充电时一律不显示。圆点只覆盖自身 24×24 区域、不接收触摸，不影响系统手势。</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSSegmentCell</string>
@@ -36,7 +40,7 @@
 		</dict>
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
-			<key>footerText</key><string>仅强制（默认）：只有我们真在拦降流时才亮红点 —— 圆点即「插件是否在起作用」的唯一判断点。常显：只要在充电就显示（我们没干活时是绿点，表示系统自己充得很好）。两个模式在没充电时都不显示。</string>
+			<key>footerText</key><string>仅强制（默认）：只有我们真在阻止断流时才亮红点 —— 圆点即「插件有没有起作用」的唯一判断点。常显：只要在充电就显示（我们没介入时是绿点，也就是电池本来的颜色）。两个模式在没充电时都不显示。</string>
 		</dict>
 
 		<dict>
@@ -70,7 +74,7 @@
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
 			<key>label</key><string>运行状态</string>
-			<key>footerText</key><string>「powerd 已加载」= 强制快充核心（吞降流）有没有注入成功；「是否在干活」= 本轮充电有没有真的拦到系统降流（红点判据）；「已拦截降流次数」累计增长代表确实在拦。「圆点当前状态」是此刻圆点应该显示的样子，不必盯着状态栏核对。若显示未加载，SSH 查 /var/mobile/Documents/ForceFastCharge/boot.log 与 sb.log。</string>
+			<key>footerText</key><string>「powerd 已加载」= 强制充电核心有没有注入成功；「是否在干活」= 本轮充电有没有真的拦下系统停充（红点判据）；「已拦截停充次数」累计增长代表确实在拦。「圆点当前状态」是此刻圆点应该显示的样子，不必盯着状态栏核对。若显示未加载，SSH 查 /var/mobile/Documents/ForceFastCharge/boot.log 与 sb.log。</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSValueCell</string>
@@ -82,13 +86,13 @@
 			<key>cell</key><string>PSValueCell</string>
 			<key>defaults</key><string>com.chargecontrol.ffstatus</string>
 			<key>key</key><string>active</string>
-			<key>label</key><string>强制快充是否在干活</string>
+			<key>label</key><string>强制充电是否在干活</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSValueCell</string>
 			<key>defaults</key><string>com.chargecontrol.ffstatus</string>
 			<key>key</key><string>blocked</string>
-			<key>label</key><string>已拦截降流次数</string>
+			<key>label</key><string>已拦截停充次数</string>
 		</dict>
 		<dict>
 			<key>cell</key><string>PSValueCell</string>
@@ -109,24 +113,12 @@
 			<key>label</key><string>圆点当前状态</string>
 		</dict>
 
-		<!-- ===================== 高温强制（高风险，默认关） ===================== -->
 		<dict>
 			<key>cell</key><string>PSGroupCell</string>
-			<key>label</key><string>高温强制</string>
-			<key>footerText</key><string>⚠️ 高风险：上面「强制快充」只拦系统软件层降流，机身过热时 iOS 仍会通过温控派生键（ThermalMaxChargeCurrent 等）停止充电——这是原厂安全保护。打开本开关会一并吞掉温控指令，设备将不再自行停止充电，可能因过热触发强制关机（黑屏）并加速电池老化。仅在你明确接受该风险时开启。</string>
-		</dict>
-		<dict>
-			<key>cell</key><string>PSSwitchCell</string>
-			<key>default</key><false/>
-			<key>defaults</key><string>com.chargecontrol</string>
-			<key>key</key><string>forceThermalOverrideEnabled</string>
-			<key>label</key><string>强制覆盖温控降流（可能黑屏）</string>
-		</dict>
-
-		<dict>
-			<key>cell</key><string>PSGroupCell</string>
-			<key>label</key><string>效果边界</string>
-			<key>footerText</key><string>充电速度最终由充电器额定功率、线材规格、电池 BMS 与机身温度共同决定。本插件只保证「系统不主动往下压电流上限」，无法突破充电器功率天花板。诊断日志：/var/mobile/Documents/ForceFastCharge/（boot.log / ffcharge.log / sb.log，安装或升级时自动清除）。</string>
+			<key>label</key><string>效果边界与风险</string>
+			<key>footerText</key><string>⚠️ 本插件的作用是「系统想停充时不让它停」。若停充源于机身过热，强行继续充会加速电池老化 —— 是否使用请自行权衡。
+另：iOS 用户态没有「提高充电电流」的接口（充电电流由内核 + 电池管理芯片决定），所以本插件做不到「让充电更快」，只能做到「不让它中断」。
+诊断日志：/var/mobile/Documents/ForceFastCharge/（boot.log / ffcharge.log / sb.log，安装或升级时自动清除）。</string>
 		</dict>
 	</array>
 </dict>

@@ -17,24 +17,31 @@ static NSString *const FFPrefDomain = @"com.chargecontrol";
 
 // 开关键
 static NSString *const kFFForceFastChargeKey  = @"forceChargeEnabled";
-// 高温强制：额外吞掉温控派生的降流键（默认关，风险高，详见 README）
-static NSString *const kFFThermalOverrideKey  = @"forceThermalOverrideEnabled";
-// 指示点显示模式（整数偏好）
-// 【v0.1.4 起只有两项，设置页也只暴露这两项】
+
+// ================================================================ 显示模式
+// 【v0.2.0：功能已从「强制快充（拦降流）」改为「强制充电（阻止系统断流）」】
 //
-// 老板的核心诉求只有一句：**我们插件真在干活时亮红点** —— 圆点就是用来判断
-// 「强制快充到底有没有起作用」的。所以默认落在「仅强制」，开箱即只有一个判断点。
+// ⭐ 为什么改（2026-10-05 实机三重取证定论）：
+//   上游那套降流键（ChargeCurrentLimit/MaxChargeCurrent/AdapterPowerLimit…）
+//   在 iOS 16.6.1 上**既不在 IORegistry、也不在 powerd 二进制里**——整个方案空转。
+//   而 iOS 用户态能写的电池属性只有 ChargeInhibit / DisableInflow / ChargeLimit /
+//   ChargingOverride，**全是「限/停」，没有任何"提高电流"的接口**；
+//   充电电流由内核 AppleSmartBatteryManager + SMC 固件决定。⇒「强制快充」做不到。
+//   能真正做到的、且老板要的 = **不让系统断流**（停充时顶住）。
 //
-//   2 = 仅强制（**默认**）：只有我们真的拦到系统降流时才显示红点；我们没干活就不显示。
+// 老板的核心诉求仍是一句：**我们插件真在干活时亮红点** —— 圆点就是判断
+// 「强制充电到底有没有起作用」的。所以默认落在「仅强制」，开箱即一个判断点。
+//
+//   2 = 仅强制（**默认**）：只有我们真的拦下系统的停充写入时才显示红点；没干活就不显示。
 //   1 = 常显（备选，老板自己不用）：只要在充电就显示
-//         绿 = 系统原生充电（我们没介入，系统自己就充得很好）
-//         红 = 我们正在拦系统的降流写（强制快充确实在干活）
+//         绿 = 系统原生充电（我们没介入，系统自己充得好好的）
+//         红 = 我们正在阻止系统停充（强制充电确实在干活）
 //   ⚠️ 不充电时两个模式都不显示。
 //
-// ⚠️ 判据不是「强制快充开关开没开」（老板的开关是常开的），而是
-//    「我们这一轮充电里有没有真的拦到系统降流」= powerd 侧的 sessionBlocked > 0。
+// ⚠️ 判据不是「开关开没开」（老板的开关是常开的），而是
+//    「我们这一轮充电里有没有真的拦到系统的停充写入」= powerd 侧的 sessionBlocked > 0。
 //
-// ⚠️ 数值刻意沿用 1/2：旧版的 1=常显、2=仅强制 语义与此一致，
+// ⚠️ 数值刻意沿用 1/2：v0.1.x 的 1=常显、2=仅强制 语义与此一致，
 //    老配置不会错位，**无需任何迁移代码**。
 //    旧值 0（「自动」）已废弃，归一化为 2（见 Settings/FRootListController.m）。
 static const NSInteger kFFShowModeAlways    = 1;
@@ -200,7 +207,7 @@ static FF_UNUSED NSDictionary *FFReadPrefsDict(void) {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
         if (!d.count) continue;
         if (!firstNonEmpty) firstNonEmpty = d;
-        if (d[kFFForceFastChargeKey] || d[kFFThermalOverrideKey]) return d;
+        if (d[kFFForceFastChargeKey]) return d;
     }
     return firstNonEmpty;
 }
