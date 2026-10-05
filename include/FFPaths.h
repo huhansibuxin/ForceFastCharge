@@ -20,13 +20,26 @@ static NSString *const kFFForceFastChargeKey  = @"forceChargeEnabled";
 // 高温强制：额外吞掉温控派生的降流键（默认关，风险高，详见 README）
 static NSString *const kFFThermalOverrideKey  = @"forceThermalOverrideEnabled";
 // 指示点显示模式（整数偏好）
-//   0 = 自动（默认）：强制快充开启时，充电中显示蓝色，不充电显示绿色
-//   1 = 常显：强制快充一开就一直显示
-//   2 = 仅强制：只看开关，不区分充电色
-//   3 = 关闭：完全不显示
-static const NSInteger kFFShowModeAuto      = 0;
+// 【v0.1.4 起只有两项，设置页也只暴露这两项】
+//
+// 老板的核心诉求只有一句：**我们插件真在干活时亮红点** —— 圆点就是用来判断
+// 「强制快充到底有没有起作用」的。所以默认落在「仅强制」，开箱即只有一个判断点。
+//
+//   2 = 仅强制（**默认**）：只有我们真的拦到系统降流时才显示红点；我们没干活就不显示。
+//   1 = 常显（备选，老板自己不用）：只要在充电就显示
+//         绿 = 系统原生充电（我们没介入，系统自己就充得很好）
+//         红 = 我们正在拦系统的降流写（强制快充确实在干活）
+//   ⚠️ 不充电时两个模式都不显示。
+//
+// ⚠️ 判据不是「强制快充开关开没开」（老板的开关是常开的），而是
+//    「我们这一轮充电里有没有真的拦到系统降流」= powerd 侧的 sessionBlocked > 0。
+//
+// ⚠️ 数值刻意沿用 1/2：旧版的 1=常显、2=仅强制 语义与此一致，
+//    老配置不会错位，**无需任何迁移代码**。
+//    旧值 0（「自动」）已废弃，归一化为 2（见 Settings/FRootListController.m）。
 static const NSInteger kFFShowModeAlways    = 1;
 static const NSInteger kFFShowModeForceOnly = 2;
+// 关闭：不再出现在设置页，仅保留为代码级兜底（临时屏蔽圆点用）
 static const NSInteger kFFShowModeOff       = 3;
 static NSString *const kFFIndicatorModeKey   = @"indicatorShowMode";
 // 指示点坐标（可配置，空/0 回退默认）
@@ -76,7 +89,10 @@ static FF_UNUSED NSString *FFJbrootPrefix(void) {
                     NSString *p = [NSString stringWithUTF8String:info.dli_fname];
                     NSArray<NSString *> *marks = @[
                         @"/usr/lib/TweakInject/",
-                        @"/Library/MobileSubstrate/DynamicLibraries/"
+                        @"/Library/MobileSubstrate/DynamicLibraries/",
+                        // 设置 bundle 自己也要能定位（它在 /Library/PreferenceBundles/ 下）。
+                        // 不写这条时设置进程只能靠下面的目录扫描兜底 —— 能work但绕远。
+                        @"/Library/PreferenceBundles/"
                     ];
                     for (NSString *m in marks) {
                         NSRange r = [p rangeOfString:m];
@@ -213,6 +229,31 @@ static FF_UNUSED NSString *FFWriteDomainPlist(NSString *suffix, NSDictionary *di
         } @catch (NSException *e) {}
     }
     return okPath;
+}
+
+// 写回**主偏好域**的一个键（设置页做旧值归一化用）。
+// 与 FFWriteDomainPlist 同理：所有候选路径都写，避免写错 jbroot 那一份。
+// 注意先读出「确实含本插件键」的那份再改，否则会把别的键一起洗掉。
+static FF_UNUSED void FFUpdatePrefsKey(NSString *key, id value) {
+    if (!key.length || !value) return;
+    NSDictionary *cur = FFReadPrefsDict();
+    NSMutableDictionary *d = cur ? [cur mutableCopy] : [NSMutableDictionary dictionary];
+    d[key] = value;
+
+    NSString *rel = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", FFPrefDomain];
+    NSMutableArray<NSString *> *cands = [NSMutableArray array];
+    NSString *jb = FFJbrootPrefix();
+    if (jb.length) [cands addObject:[jb stringByAppendingString:rel]];
+    [cands addObject:rel];
+    [cands addObject:[@"/var/jb" stringByAppendingString:rel]];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *p in cands) {
+        @try {
+            [fm createDirectoryAtPath:[p stringByDeletingLastPathComponent]
+          withIntermediateDirectories:YES attributes:nil error:nil];
+            [d writeToFile:p atomically:YES];
+        } @catch (NSException *e) {}
+    }
 }
 
 // ---------------------------------------------------------------- 诊断日志目录

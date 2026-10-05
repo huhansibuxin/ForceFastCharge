@@ -26,6 +26,28 @@
 - 本插件**默认放行**温控键，所以只开「强制快充」不会触发该路径。
 - 只有你显式打开第二个开关才会覆盖温控，此时需自行承担过热强制关机与电池老化风险。
 
+## 状态指示点（圆点）
+
+> **圆点的唯一作用：判断强制快充到底有没有在起作用。** 所以默认模式就是「仅强制」——
+> 只有一个判断点：我们真在干活（拦到系统降流）才亮红点。其余情况一律不显示。
+
+判据**不是**「强制快充开关开没开」（本插件的用法是常开），而是
+**这一轮充电里我们有没有真的拦到系统降流**（powerd 侧 `sessionBlocked > 0`）。
+每次开始充电会话时该计数会自动重置。
+
+| 模式 | 值 | 行为 |
+|---|---|---|
+| **仅强制**（默认） | `2` | 只有我们真在拦降流时才显示 🔴 红点；我们没干活就不显示 |
+| 常显 | `1` | 只要在充电就显示：🟢 绿 = 系统原生充电（我们没介入）；🔴 红 = 我们在拦降流 |
+
+- **不充电时两个模式都不显示**（拔线即消失）。
+- 颜色只有两个：**绿 = 系统自己就充得很好、我们无事可做**；**红 = 强制快充确实在干活**。
+- 位置由设置页的 `dotX` / `dotY` 决定（默认 X=294 Y=29.4，灵动岛右侧）。
+- 实现：独立 `UIWindow` + `windowLevel = UIWindowLevelAlert + 1.0`，`userInteractionEnabled = NO`，
+  窗口只占 24×24，不接收触摸、不影响手势。
+- 旧版 4 个模式（0 自动 / 1 常显 / 2 仅强制 / 3 关闭）已收敛为 2 个；旧值 1/2 语义不变、
+  不需要迁移，其余旧值在打开设置页时自动归一化为「仅强制」。
+
 ## 运行状态标志
 
 设置页「运行状态」区实时显示（数据由各 dylib 写入 Preferences 域文件，设置页按 `defaults=` 域读取）：
@@ -33,13 +55,23 @@
 | 行 | 数据源 | 含义 |
 |---|---|---|
 | powerd 已加载 | `com.chargecontrol.ffstatus` 域 `loaded` | `是` = dylib 已注入 powerd 且 hook 装好；`否` = 未注入或未重启 powerd |
-| 已拦截写次数 | `com.chargecontrol.ffstatus` 域 `blocked` | 启动至今被拦下的降流写次数，**数值持续增长即代表确实在拦截生效** |
+| 强制快充是否在干活 | `com.chargecontrol.ffstatus` 域 `active` | `工作中` = 本轮充电拦到过降流（**红点判据**）；`待命` = 还没拦到 |
+| 已拦截降流次数 | `com.chargecontrol.ffstatus` 域 `blocked` | 启动至今被拦下的降流写次数，**数值持续增长即代表确实在拦截生效** |
 | 指示器已加载 | `com.chargecontrol.sbstatus` 域 `dotLoaded` | `是` = 指示点 target 已注入 SpringBoard |
-| 指示点窗口 | `com.chargecontrol.sbstatus` 域 `dotWindow` | `是` = 指示点 UIWindow 已挂到屏幕 |
+| 圆点窗口 | `com.chargecontrol.sbstatus` 域 `dotWindow` | `是` = 指示点 UIWindow 已挂到屏幕 |
+| 圆点当前状态 | `com.chargecontrol.sbstatus` 域 `dotState` | 此刻圆点应该是什么样（`红 · 强制快充工作中` / `绿 · 系统原生充电` / `不显示`），不必盯着状态栏核对 |
 
 > ⚠️ roothide 隐根下设置页读写 `/var/mobile/Library/Preferences/` 会被自动重定向到 jbroot 内的同名路径，
 > 而注入系统进程的 dylib 直读直写真实路径。本插件已内置 jbroot 自定位（`FFJbrootPrefix`，dladdr 反推 + 目录扫描 + `/var/jb` 三级回退），
-> 保证两边落到**同一个文件**——这正是 v0.1.3 修复「设置页永远显示未加载」的关键。
+> 并把**所有候选路径都写一遍**，保证两边落到同一个文件——这是 v0.1.3 修复「设置页永远显示未加载」的关键。
+
+### 排查「圆点一直不红」：先看 hook 有没有被调用
+
+`ffcharge.log` 里的 `setter key seen: <键名>` 与 `ff_status.plist` 的 `setterCalls` 是专门为此加的：
+
+- `setterCalls == 0` → powerd **压根没调用**我们 hook 的 setter ⇒ hook 点不对（不是白名单问题）；
+- `setterCalls > 0` 且 `blockedWriteCount == 0` → 调了，但**键名没命中白名单**，需要扩白名单；
+- `blockedWriteCount > 0` → 拦截链通了，圆点该是红的。
 
 ## 与旧版（ChargeControl 激进派）的区别
 
@@ -64,6 +96,8 @@
 |---|---|---|---|
 | `forceChargeEnabled` | Bool | `false` | 强制快充主开关 |
 | `forceThermalOverrideEnabled` | Bool | `false` | 高温强制（高风险） |
+| `indicatorShowMode` | Int | `2` | 圆点模式：`2` 仅强制（默认，只有我们干活才亮红）；`1` 常显（充电就显示，绿/红） |
+| `dotX` / `dotY` | String | `294` / `29.4` | 圆点中心坐标（pt） |
 
 偏好文件：`/var/mobile/Library/Preferences/com.chargecontrol.plist`（与旧版 ChargeControl 共用域）
 设置变更通过 Darwin 通知 `com.chargecontrol/settingsChanged` 即时生效，另有 2s 轮询兜底。

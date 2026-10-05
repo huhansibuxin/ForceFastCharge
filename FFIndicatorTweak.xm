@@ -29,6 +29,7 @@
 static BOOL gLastForce    = NO;
 static BOOL gLastThermal  = NO;
 static BOOL gLastCharging = NO;
+static BOOL gLastActive   = NO;   // 上一轮「我们有没有在拦降流」，纳入变化检测
 static NSInteger gLastMode = -1;
 static CGFloat gLastX = -1, gLastY = -1;   // 坐标也要纳入变化检测，否则改坐标不生效
 static BOOL gEnabled      = NO;   // 是否成功进入运行态
@@ -125,6 +126,19 @@ static BOOL readCharging(void) {
     return NO;
 }
 
+// 「我们的强制快充这一轮有没有真的在干活」= powerd 侧 sessionBlocked > 0。
+// ⚠️ 判据不是「开关开没开」（老板的开关是常开的），而是「有没有真拦到系统降流」。
+//    powerd 把结果写进 ff_status.plist 的 active 字段（root:wheel 0644，SB 可读）。
+static BOOL readForceActive(void) {
+    @try {
+        NSDictionary *st = [NSDictionary dictionaryWithContentsOfFile:FFStatusPath()];
+        id v = st[@"active"];
+        if ([v isKindOfClass:[NSNumber class]]) return [v boolValue];
+        if ([v isKindOfClass:[NSString class]]) return [(NSString *)v boolValue];
+    } @catch (NSException *e) {}
+    return NO;
+}
+
 // ---------------------------------------------------------------- 状态回写
 static void writeSbStatus(CGFloat cx, CGFloat cy) {
     NSString *dir = FFLogDir();
@@ -132,11 +146,26 @@ static void writeSbStatus(CGFloat cx, CGFloat cy) {
                               withIntermediateDirectories:YES
                                                attributes:nil error:nil];
 
+    // 把「此刻圆点该是什么样」也算出来给设置页看 —— 老板不必盯着状态栏就能核对逻辑
+    NSString *dotState;
+    BOOL visible;
+    if (gLastMode == kFFShowModeOff || !gLastCharging) {
+        visible = NO;
+    } else if (gLastMode != kFFShowModeAlways && !gLastActive) {
+        visible = NO;                       // 非「常显」（即「仅强制」或旧值）：我们没干活 → 不显示
+    } else {
+        visible = YES;
+    }
+    if (!visible)             dotState = @"不显示";
+    else if (gLastActive)     dotState = @"红 · 强制快充工作中";
+    else                      dotState = @"绿 · 系统原生充电";
+
     // ① 设置页读的域文件（键名必须与 Root.plist 的 key 逐字一致：
-    //    defaults=com.chargecontrol.sbstatus，键 dotLoaded / dotWindow）
+    //    defaults=com.chargecontrol.sbstatus，键 dotLoaded / dotWindow / dotState）
     NSDictionary *domain = @{
         @"dotLoaded" : (gEnabled ? @"是" : @"否"),
         @"dotWindow" : ([FFIndicator windowCreated] ? @"已创建" : @"未创建"),
+        @"dotState"  : dotState,
     };
     FFWriteDomainPlist(@"sbstatus", domain);
 
@@ -147,6 +176,8 @@ static void writeSbStatus(CGFloat cx, CGFloat cy) {
         @"force"         : @(gLastForce),
         @"thermal"       : @(gLastThermal),
         @"charging"      : @(gLastCharging),
+        @"active"        : @(gLastActive),
+        @"dotState"      : dotState,
         @"showMode"      : @(gLastMode),
         @"dotX"          : @(cx),
         @"dotY"          : @(cy),
@@ -163,24 +194,25 @@ static void refreshIndicator(BOOL forceNotify) {
     BOOL thermal  = readBool(kFFThermalOverrideKey, NO);
     if (!force) thermal = NO;
     BOOL charging = readCharging();
-    NSInteger mode = readInt(kFFIndicatorModeKey, kFFShowModeAuto);
+    BOOL active   = readForceActive();     // 我们这一轮充电有没有真拦到降流 → 决定红/绿
+    NSInteger mode = readInt(kFFIndicatorModeKey, kFFShowModeForceOnly);
     CGFloat cx = readDouble(kFFDotXKey, kFFDotXDefault);
     CGFloat cy = readDouble(kFFDotYKey, kFFDotYDefault);
 
     BOOL changed = (force != gLastForce) || (thermal != gLastThermal) ||
-                   (charging != gLastCharging) || (mode != gLastMode) ||
-                   (cx != gLastX) || (cy != gLastY);
+                   (charging != gLastCharging) || (active != gLastActive) ||
+                   (mode != gLastMode) || (cx != gLastX) || (cy != gLastY);
 
     gLastForce = force; gLastThermal = thermal;
-    gLastCharging = charging; gLastMode = mode;
-    gLastX = cx; gLastY = cy;
+    gLastCharging = charging; gLastActive = active;
+    gLastMode = mode; gLastX = cx; gLastY = cy;
 
     if (!forceNotify && !changed) return;   // 无变化不打扰
 
-    sbLog(@"refresh force=%d thermal=%d charging=%d mode=%ld coord=(%.1f,%.1f) win=%d",
-          force, thermal, charging, (long)mode, cx, cy, [FFIndicator windowCreated]);
+    sbLog(@"refresh force=%d thermal=%d charging=%d active=%d mode=%ld coord=(%.1f,%.1f) win=%d",
+          force, thermal, charging, active, (long)mode, cx, cy, [FFIndicator windowCreated]);
 
-    [[FFIndicator shared] updateWithForceOn:force thermalOn:thermal charging:charging];
+    [[FFIndicator shared] updateWithCharging:charging active:active mode:mode];
     writeSbStatus(cx, cy);
 }
 

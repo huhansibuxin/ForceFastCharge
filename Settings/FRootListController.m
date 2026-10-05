@@ -5,10 +5,28 @@
 @interface FRootListController : PSListController
 @end
 
+// v0.1.4 显示模式旧值归一化（幂等、只跑一次）。
+// 旧版有 4 个模式（0自动 / 1常显 / 2仅强制 / 3关闭），新版只留 2 个、数值沿用 1/2。
+// 旧值 0/3 不在分段控件的 validValues 里 → 会出现「一个都不高亮」，
+// 老板会以为是"又坏了"。统一折成「仅强制」(2)：老板的核心诉求就是
+// 「只有我们插件真在干活时才亮红点」，其余情况不显示。
+static void ff_normalizeShowMode(void) {
+    NSDictionary *d = FFReadPrefsDict();
+    if (!d) return;
+    id v = d[@"indicatorShowMode"];
+    if (!v) return;                                   // 没设过 → 用 default(2)，不必写盘
+    NSInteger m = [v integerValue];
+    if (m == kFFShowModeAlways || m == kFFShowModeForceOnly) return;   // 已是新值
+    FFUpdatePrefsKey(@"indicatorShowMode", @(kFFShowModeForceOnly));
+}
+
 @implementation FRootListController
 
 - (id)specifiers {
-    if (_specifiers == nil) _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+    if (_specifiers == nil) {
+        ff_normalizeShowMode();
+        _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+    }
     return _specifiers;
 }
 

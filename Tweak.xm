@@ -39,7 +39,9 @@ static BOOL gForceFastCharge = NO;
 static BOOL gThermalOverride = NO;
 static BOOL gHookInstalled = NO;
 static uint64_t gLastLogNS = 0;
-static int gBlockedCount = 0;
+static int gBlockedCount = 0;     // 累计拦下的降流写次数（历史总量）
+static int gSessionBlocked = 0;   // **本次充电会话内**拦下的次数 —— 指示点红/绿的唯一判据
+static int gSetterCalls = 0;      // hook 被调用的总次数（诊断：证明 hook 点到底有没有被 powerd 用到）
 static BOOL gLastCharging = NO;   // 当前充电状态，供状态文件与指示器读取
 
 // ---------------------------------------------------------------- 诊断日志
@@ -102,19 +104,24 @@ static BOOL readBoolPref(NSString *key, BOOL fallback) {
 //    完全对不上 → 设置页永远显示「未加载」。现在写官方域文件（roothide 下位于
 //    jbroot 的 Preferences 目录，正好是设置页读的那份），另存诊断文件供人排查。
 static int  gStatBlocked  = -1;
+static int  gStatSession  = -1;   // 会话计数也要参与节流，否则「刚拦到降流」不会立即落盘
 static BOOL gStatCharging = NO;
 static BOOL gStatForce    = NO;
+static BOOL gStatThermal  = NO;   // 温控开关也要参与，否则关掉后状态文件停在旧值
 
 static void writeStatusFile(void) {
     if (!gHookInstalled) return;
     // 节流：2s 定时器会频繁调用本函数，内容没变就不重复写盘（省 IO）
-    if (gStatBlocked == gBlockedCount && gStatCharging == gLastCharging &&
-        gStatForce == gForceFastCharge) {
+    if (gStatBlocked == gBlockedCount && gStatSession == gSessionBlocked &&
+        gStatCharging == gLastCharging && gStatForce == gForceFastCharge &&
+        gStatThermal == gThermalOverride) {
         return;
     }
     gStatBlocked  = gBlockedCount;
+    gStatSession  = gSessionBlocked;
     gStatCharging = gLastCharging;
     gStatForce    = gForceFastCharge;
+    gStatThermal  = gThermalOverride;
 
     NSString *dir = FFLogDir();
     [[NSFileManager defaultManager] createDirectoryAtPath:dir
@@ -125,17 +132,24 @@ static void writeStatusFile(void) {
     NSDictionary *domain = @{
         @"loaded"  : (gHookInstalled ? @"是" : @"否"),
         @"blocked" : [NSString stringWithFormat:@"%d", gBlockedCount],
+        // 「强制快充工作中」= 本次充电会话拦到过降流 —— 指示点红/绿的判据
+        @"active"  : (gSessionBlocked > 0 ? @"工作中" : @"待命"),
     };
     FFWriteDomainPlist(@"ffstatus", domain);
 
     // ② 诊断文件（字段更全，人肉排查用）
+    //    setterCalls 很关键：若它一直是 0，说明 powerd 压根没调用我们 hook 的那两个
+    //    setter（hook 点不对）；若它 >0 而 blockedWriteCount==0，说明调了但键名没命中白名单。
     NSDictionary *st = @{
         @"hookInstalled"     : @(gHookInstalled),
         @"forceEnabled"      : @(gForceFastCharge),
         @"thermalOverride"   : @(gThermalOverride),
         @"charging"          : @(gLastCharging),
-        @"pid"               : @((int)getpid()),
+        @"active"            : @(gSessionBlocked > 0),
+        @"sessionBlocked"    : @(gSessionBlocked),
         @"blockedWriteCount" : @(gBlockedCount),
+        @"setterCalls"       : @(gSetterCalls),
+        @"pid"               : @((int)getpid()),
         @"updatedAt"         : [[NSDate date] description]
     };
     [st writeToFile:[dir stringByAppendingPathComponent:@"ff_status.plist"] atomically:YES];
@@ -191,6 +205,12 @@ static void pollChargeState(void) {
     BOOL charging = readIsCharging();
     if (charging == gLastCharging) return;   // 无变化不打扰
     gLastCharging = charging;
+    if (charging) {
+        // 新一次充电会话开始 → 重置「我们有没有在工作」的判据。
+        // 不重置的话，上一次充电拦到过降流会让圆点永远停在红色。
+        gSessionBlocked = 0;
+        logDiag(@"charging session start -> sessionBlocked reset");
+    }
     logDiag(@"charging state -> %@", charging ? @"YES" : @"NO");
     writeStatusFile();                       // 让指示器读到最新 charging
     notify_post(FFChargeStateNotifName.UTF8String);
@@ -264,14 +284,44 @@ typedef kern_return_t (*IOServiceSetCFPropertyFn)(io_service_t, CFStringRef, CFT
 static IORegistryEntrySetCFPropertyFn orig_SetCFProp = NULL;
 static IOServiceSetCFPropertyFn orig_SvcSetCFProp = NULL;
 
+// 记账：证明 hook 到底有没有被 powerd 用到，以及它都写了哪些键。
+// 为什么必须有它：只看 blockedWriteCount==0 无法区分两种情况 ——
+//   ① powerd 压根没调用这个 setter（hook 点不对）
+//   ② 调用了，但键名不在白名单里（白名单该扩）
+// 打出「总调用数 + 出现过的键名（去重，上限 48 个）」就能一眼分辨。
+static void noteSetterCall(CFStringRef propertyName) {
+    gSetterCalls++;
+    static NSMutableSet<NSString *> *seen = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+    // 采够 48 个键名后就不再进锁：这是 powerd 的热路径，不能为纯诊断付互斥开销。
+    // （这里无锁读 count 是刻意的：最坏情况只是多进一次锁，代价可忽略。）
+    if (seen.count >= 48) return;
+    NSString *n = propertyName ? (__bridge NSString *)propertyName : @"(null)";
+    @synchronized (seen) {
+        if (seen.count < 48 && ![seen containsObject:n]) {
+            [seen addObject:n];
+            logDiag(@"setter key seen: %@", n);
+        }
+    }
+}
+
 // 只在开关打开时吃掉降流写；其余一律原样透传给系统
 static kern_return_t hook_SetCFProperty(io_registry_entry_t entry,
                                         CFStringRef propertyName,
                                         CFTypeRef property) {
+    noteSetterCall(propertyName);
     if (shouldBlockWrite(propertyName)) {
         gBlockedCount++;
-        logThrottled(@"blocked down-limit write: %@ (total=%d)",
-                     (__bridge NSString *)propertyName, gBlockedCount);
+        BOOL firstInSession = (gSessionBlocked == 0);
+        gSessionBlocked++;
+        logThrottled(@"blocked down-limit write: %@ (total=%d, session=%d)",
+                     (__bridge NSString *)propertyName, gBlockedCount, gSessionBlocked);
+        if (firstInSession) {
+            // 状态从「待命」翻成「工作中」→ 立即落盘并通知 SpringBoard 翻红
+            writeStatusFile();
+            notify_post(FFChargeStateNotifName.UTF8String);
+        }
         return KERN_SUCCESS;   // 告诉系统「已处理」，实际不写入 → 系统无法把上限压低
     }
     return orig_SetCFProp ? orig_SetCFProp(entry, propertyName, property) : KERN_FAILURE;
@@ -280,10 +330,17 @@ static kern_return_t hook_SetCFProperty(io_registry_entry_t entry,
 static kern_return_t hook_SvcSetCFProperty(io_service_t service,
                                            CFStringRef propertyName,
                                            CFTypeRef property) {
+    noteSetterCall(propertyName);
     if (shouldBlockWrite(propertyName)) {
         gBlockedCount++;
-        logThrottled(@"blocked down-limit write(svc): %@ (total=%d)",
-                     (__bridge NSString *)propertyName, gBlockedCount);
+        BOOL firstInSession = (gSessionBlocked == 0);
+        gSessionBlocked++;
+        logThrottled(@"blocked down-limit write(svc): %@ (total=%d, session=%d)",
+                     (__bridge NSString *)propertyName, gBlockedCount, gSessionBlocked);
+        if (firstInSession) {
+            writeStatusFile();
+            notify_post(FFChargeStateNotifName.UTF8String);
+        }
         return KERN_SUCCESS;
     }
     return orig_SvcSetCFProp ? orig_SvcSetCFProp(service, propertyName, property) : KERN_FAILURE;

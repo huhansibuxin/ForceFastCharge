@@ -8,11 +8,14 @@
 //   · 坐标从偏好读取、可配置；空/0/非法一律回退默认，避免圆点飞出屏幕
 //   · 全程 @try/@catch 兜底，任何异常静默失败，绝不影响 SpringBoard
 //
-//  颜色语义（四态一眼可辨）：
-//   灰 = 未充电且未强制        （默认不显示，此处仅作兜底）
-//   蓝 = 正在充电，但强制快充未开（正常充电）
-//   绿 = 强制快充生效中        （已吞掉系统降流写）
-//   红 = 强制快充 + 温控覆盖   （高风险档，吞掉了温控派生键）
+//  颜色语义（v0.1.4 起只有两个颜色，老板明确要求）：
+//   绿 = 系统原生充电 —— 我们的强制快充**没有介入**（系统自己就充得很好，我们无事可做）
+//   红 = 我们**正在拦系统的降流写** —— 强制快充确实在干活
+//   不充电 = 两个模式都一律不显示（拔线即消失）
+//
+//  模式（只有两个，见 kFFShowModeAlways / kFFShowModeForceOnly）：
+//   常显   ：只要在充电就显示（绿打底，我们在干活时转红）
+//   仅强制 ：只有我们真在拦降流时才显示红点；我们没干活就不显示
 //
 
 #import <UIKit/UIKit.h>
@@ -24,10 +27,12 @@
 // 注意：只读指针，后台线程调用安全。
 + (BOOL)windowCreated;
 // 依据当前状态更新圆点：显示/隐藏 + 颜色
-// charging: 当前是否正在充电；forceOn: 强制快充是否开启；thermalOn: 温控覆盖是否开启
-- (void)updateWithForceOn:(BOOL)forceOn
-                 thermalOn:(BOOL)thermalOn
-                 charging:(BOOL)charging;
+//   charging: 是否正在充电（为 NO 时两个模式都不显示）
+//   active  : 我们的强制快充这一轮有没有真的拦到系统降流（sessionBlocked > 0）
+//   mode    : kFFShowModeAlways / kFFShowModeForceOnly（其余值按「仅强制」处理 —— 宁可不显示）
+- (void)updateWithCharging:(BOOL)charging
+                    active:(BOOL)active
+                      mode:(NSInteger)mode;
 @end
 
 @implementation FFIndicator
@@ -120,54 +125,48 @@ static CGFloat ff_coord(NSString *key, CGFloat def) {
     g_dot.frame = CGRectMake(8, 8, 8, 8);
 }
 
-- (void)updateWithForceOn:(BOOL)forceOn
-                thermalOn:(BOOL)thermalOn
-                charging:(BOOL)charging {
+- (void)updateWithCharging:(BOOL)charging
+                    active:(BOOL)active
+                      mode:(NSInteger)mode {
     // ⚠️ 必须切主线程：调用方（SpringBoard 侧轮询）跑在后台队列，
     //    跨线程操作 UIKit 会让 SpringBoard 崩溃循环 → 黑屏。
     dispatch_async(dispatch_get_main_queue(), ^{
         [self ensureWindow];
         if (!g_win) return;
 
-        // 读显示模式
-        NSInteger mode = kFFShowModeAuto;
-        @try {
-            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:FFPrefPath()];
-            id v = d[kFFIndicatorModeKey];
-            if ([v isKindOfClass:[NSNumber class]]) mode = [v integerValue];
-            else if ([v isKindOfClass:[NSString class]]) mode = [v integerValue];
-        } @catch (NSException *e) {}
-
-        if (mode == kFFShowModeOff) {                 // 模式3：完全关闭
+        if (mode == kFFShowModeOff) {                 // 模式3：关闭（代码级兜底）
             if (!g_win.hidden) g_win.hidden = YES;
             return;
         }
 
-        BOOL show = NO;
-        UIColor *c = nil;
-        if (forceOn) {
-            if (thermalOn) {
-                // 红：强制 + 温控覆盖（最高优先级）
-                c = [UIColor colorWithRed:1.0 green:0.25 blue:0.2 alpha:1.0];
-                show = YES;
-            } else if (mode == kFFShowModeAuto) {
-                // 自动：充电中蓝色、未充电绿色
-                c = charging ? [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:1.0]
-                             : [UIColor colorWithRed:0.0 green:0.8 blue:0.4 alpha:1.0];
-                show = YES;
-            } else if (mode == kFFShowModeAlways || mode == kFFShowModeForceOnly) {
-                c = [UIColor colorWithRed:0.0 green:0.8 blue:0.4 alpha:1.0];
-                show = YES;
-            }
+        // ⚠️ 不充电 → 两个模式都一律不显示（老板明确要求：拔线即消失）
+        if (!charging) {
+            if (!g_win.hidden) g_win.hidden = YES;
+            return;
+        }
+
+        BOOL show;
+        if (mode == kFFShowModeAlways) {
+            show = YES;             // 常显：充电中就显示
+        } else {
+            // 仅强制（默认，含任何未识别的旧值）—— 只有一个判断点：
+            // 我们真在干活才显示。宁可不显示，也不要亮一个"看起来在工作"的点。
+            show = active;
         }
         if (!show) {
             if (!g_win.hidden) g_win.hidden = YES;
             return;
         }
+
         // 坐标每次刷新都重算（设置页可改）
         [self moveToCoord:ff_coord(kFFDotXKey, kFFDotXDefault)
                        cy:ff_coord(kFFDotYKey, kFFDotYDefault)];
-        g_dot.backgroundColor = c;
+        // 只有两个颜色：
+        //   红 = 我们正在拦系统降流（强制快充确实在工作）
+        //   绿 = 系统原生充电（我们没介入，系统自己就充得很好）
+        g_dot.backgroundColor = active
+            ? [UIColor colorWithRed:1.00 green:0.23 blue:0.19 alpha:1.0]   // 红
+            : [UIColor colorWithRed:0.20 green:0.78 blue:0.35 alpha:1.0];  // 绿
         if (g_win.hidden) g_win.hidden = NO;
     });
 }
