@@ -4,6 +4,10 @@
 
 > ⚠️ **v0.2.0 功能转向**：本插件原来做的是「强制快充」（吞掉系统的降流写，让充电更快）。
 > 该方向已被实机证据否定，现改为**强制充电**（阻止系统断流）。原因见下一节。
+>
+> 🔧 **v0.3.0**：修「插上充电器圆点不显示」（建窗与状态变化耦合导致的死等，见下文）；
+> 并为「强制充电到底走哪条通道」加了 user client external method 探针。
+> 待机心跳现在也带电池遥测 —— 任何时刻取日志都能判断线在不在、系统有没有在限流。
 
 ## 为什么不做「强制快充」了
 
@@ -180,6 +184,42 @@ ARC 下它在离开作用域时被 release，libdispatch 随即 cancel 掉这个
 **插上充电器圆点不亮、拔掉也不灭，点一下设置页（应用位置）才更新**。
 
 现在改为**文件级静态变量**持有强引用（block 内不捕获它，无循环引用）。
+
+### v0.3.0：插上充电器圆点仍不显示 —— 建窗与状态变化被耦合在一起
+
+定时器修好之后仍然"插上不亮"，实机日志把根因钉死了：
+
+```
+[1791186075.742] refresh force=1 charging=1 active=0 mode=1 ... win=0 vis=0 scene=0
+[1791186076.377] refresh force=1 charging=1 active=0 mode=1 ... win=0 vis=0 scene=0
+   ← 之后 47 秒完全静默（充电器一直插着）
+[1791186123.278] refresh force=1 charging=0 active=0 mode=1 ... win=1 vis=1 scene=0
+   ← 拔线的那一帧，窗口才被建出来
+```
+
+**根因是刷新入口的短路顺序**，不是注入、不是开关、不是场景：
+
+```objc
+// 旧代码（v0.2.2）
+if (!forceNotify && !changed) return;          // ← 状态没变就提前返回
+...
+[[FFIndicator shared] updateWithCharging:...]; // ← 而建窗只发生在这里面！
+```
+
+SB 刚重启时 scene 尚未就绪 → 首次建窗失败 → 插着充电器时状态**恒稳** →
+每 2s 的 tick 全部在 `return` 处提前退出 → **窗口再也没有任何重试机会**，
+一直到某次状态翻转（拔线）才把窗口建出来。
+
+v0.3.0 的修法（四件事一起做，一次到位）：
+
+| # | 改动 | 解决什么 |
+|---|---|---|
+| ① | 每轮 tick **无条件先** `ensureWindowAsync()`（幂等、非阻塞），再做变化检测 | 建窗与状态变化彻底解耦，失败后每 2s 自动重试 |
+| ② | `ff_currentScene()` 放宽：ForegroundActive → 任意 `UIWindowScene` → 从已有窗口反查 | SB 启动早期/锁屏切换时不再"挑不到场景" |
+| ③ | `+sceneState` / `+diagLine` 改读**主线程缓存** | 后台线程直接读 `UIApplication` 拿不到 connectedScenes，**恒返回 0** —— 这个假值会把人往"场景不对"的沟里带 |
+| ④ | 窗口改为**铺满 scene**、圆点用绝对坐标定位（不再用 24×24 小窗口） | scene 化 `UIWindow` 的 frame 由 scene 掌管，小 frame 可能被系统重置 → 圆点随窗口飘到原点，日志仍报"可见"却肉眼看不到 |
+| ⑤ | 窗口补一个透明空 `rootViewController`，`windowLevel` 提到 `Alert + 100`，坐标 clamp 进屏幕 | 排除"裸窗口不参与合成""被状态栏/灵动岛盖住""坐标填越界"三种不显示 |
+
 验证方法（插拔充电器后最多等 2s）：
 
 ```bash
@@ -188,16 +228,41 @@ ssh root@192.168.3.156 'tail -20 /rootfs/private/var/mobile/Documents/ForceFastC
 
 | 观察 | 结论 |
 |---|---|
-| `heartbeat ... vis=1 scene=1` | 定时器与圆点窗口都正常（1 行/分钟） |
+| `heartbeat ... vis=1 ... [lvl=2100 hid=0 ...]` | 定时器与圆点窗口都正常（1 行/分钟） |
 | `refresh ... charging=1 vis=1` | 插电后圆点已显示 |
-| `refresh ... charging=0` | 拔线后圆点已隐藏 |
-| `vis=0` 但 `charging=1`、`mode=1` | 逻辑要显示但窗口被隐藏 —— 视为异常，需进一步查 |
-| 连 `heartbeat` 都没有 | 定时器仍未工作（`scene` 值也会一并给出，便于判断场景是否不活跃） |
+| `refresh ... charging=0 vis=0` | 拔线后圆点已隐藏 |
+| `[win=nil]` 或 `[no-scene]` | 窗口压根没建出来（场景未就绪）—— 现在每 2s 会重试，持续出现才算异常 |
+| `hid=0` 却肉眼看不到 | 看同一行的 `win=` / `dot=` 坐标，判断是否被遮挡或跑到屏外 |
+| 连 `heartbeat` 都没有 | 定时器仍未工作 |
 
 > ⚠️ 同类陷阱：ARC + GCD 定时器**必须**由 `static` / ivar 持有强引用。
 > 写成局部变量在模拟器/单次调用里可能"看起来正常"（恰好没被回收），
 > 在常驻进程里则表现为"功能时好时坏或干脆全无"。排查此类问题时，
 > 第一件事就是**确认心跳/日志里的"定期"输出到底有没有**。
+>
+> ⚠️ 另一个陷阱：**别把"建窗"这类必须重试的动作放在"状态变化"的短路分支后面**。
+> 事件驱动省 CPU 是对的，但"每轮都该做的事"（保活、重试、兜底）必须放在短路之前。
+
+### v0.3.0：77% 停充却没有任何拦截 —— 先分清「拔线」与「系统停充」
+
+powerd 侧现在的 `heartbeat` **待机时也带电池遥测**，任何时刻取日志都能一眼判定：
+
+```bash
+ssh root@192.168.3.156 'tail -5 /rootfs/private/var/mobile/Documents/ForceFastCharge/ffcharge.log'
+```
+
+| 字段 | 含义 |
+|---|---|
+| `ext=1` / `ext=0` | ExternalConnected：**1 = 线插着**、0 = 真的没有外部电源 |
+| `ncr=` | NotChargingReason：0=正常；128=未接充电器；其余值=被系统/固件限制 |
+| `mA=` | ChargingCurrent：当前实际充电电流，0 = 真的没在进电 |
+| `vac=` | VacVoltageLimit：输入电压上限。正常 5V 档位约 5000；被压到 4360 之类 = 系统在**降功率** |
+| `temp=` | 电池温度（℃）。>40 起降流，>45 附近可能直接停充 |
+| `setterCalls=` | 累计的 IOKit setter 调用数。**boot 后恒定不增长 = powerd 不用这条通道控制充电** |
+| `io-conn method/struct: <服务> selector=N` | v0.3.0 新增探针：powerd 通过 user client external method 下发了哪些命令（只观测不改行为） |
+
+**判读分水岭**：停充那一刻若 `ext=1` 而 `sessionBlocked=0` ⇒ 停充由内核/SMC 直接执行、
+不经过 powerd，**我们拦不到**；若 `ext=0` ⇒ 那一刻线确实不在（拔线或接触不良）。
 
 ## 构建
 

@@ -509,6 +509,127 @@ static kern_return_t hook_SvcSetCFProperty(io_service_t service,
     return orig_SvcSetCFProp ? orig_SvcSetCFProp(service, propertyName, property) : KERN_FAILURE;
 }
 
+// ---------------------------------------------------------------- 连接→服务映射（v0.3.0）
+// 为下面 IOConnectCall* 探针服务：把 user client 句柄映射回它所属的 IO service 类名，
+// 这样日志里才能说出「是 AppleSMC 还是 AppleSmartBatteryManager 在发命令」。
+// 刻意用**定长数组 + 线性扫描**（零锁、零分配）：这些探针挂在 powerd 的热路径上，
+// 不能为纯诊断引入互斥或 ObjC 分配。
+#define FF_CONN_MAX 32
+static mach_port_t gConnPort[FF_CONN_MAX];
+static char        gConnCls [FF_CONN_MAX][64];
+static int         gConnCnt = 0;
+
+static void ff_connRemember(mach_port_t port, const char *cls) {
+    if (!cls || !cls[0]) return;
+    for (int i = 0; i < gConnCnt && i < FF_CONN_MAX; i++) {
+        if (gConnPort[i] == port) {                       // 句柄复用 → 覆盖类名
+            strncpy(gConnCls[i], cls, sizeof(gConnCls[i]) - 1);
+            gConnCls[i][sizeof(gConnCls[i]) - 1] = '\0';
+            return;
+        }
+    }
+    if (gConnCnt < FF_CONN_MAX) {
+        gConnPort[gConnCnt] = port;
+        strncpy(gConnCls[gConnCnt], cls, sizeof(gConnCls[gConnCnt]) - 1);
+        gConnCls[gConnCnt][sizeof(gConnCls[gConnCnt]) - 1] = '\0';
+        gConnCnt++;
+    }
+}
+
+static const char *ff_connClassOf(mach_port_t port) {
+    for (int i = 0; i < gConnCnt && i < FF_CONN_MAX; i++) {
+        if (gConnPort[i] == port) return gConnCls[i];
+    }
+    return "(unknown)";
+}
+
+// ---------------------------------------------------------------- IOConnectCall* 探针（v0.3.0，只观测不拦截）
+// ⭐ 为什么必须有它（回答"强制充电到底能不能做"）：
+//   v0.2.x 的实机证据已经证明 powerd **不通过** IORegistryEntrySetCFProperty 控制充电
+//   —— setterCalls 从 boot 后恒为 22 再不增长，且全是 TimeZoneOffsetSeconds /
+//   SleepWakeUUID 这类系统键，整个充电会话里 0 次充电相关写。也就是说
+//   「拦 IOKit setter」这条路在 iOS 16.6.1 上根本没有承载逻辑，是空转。
+//   剩下的唯一可能通道就是 user client 的 external method：
+//     powerd 打开 AppleSmartBatteryManager / AppleSMC 后，
+//     若通过 IOConnectCallMethod/StructMethod 下发充电控制，那我们 hook 这两个
+//     函数就能看到 (service, selector)。
+//   ⚠️ 本探针**只记录，绝不改动**任何参数或返回值 —— externalMethod 的参数结构
+//      未知，盲拦有把电池通信搞坏的风险。等日志证明确实用它，再决定要不要动。
+//   只盯电源/电池链路的 service，其它（KeyStore 等）噪声太大直接忽略。
+static BOOL ff_shouldWatchConn(const char *cls) {
+    if (!cls || !cls[0]) return NO;
+    static const char *watch[] = {
+        "AppleSmartBattery", "AppleSMC", "IOPMrootDomain", "AppleSmartBatteryManager"
+    };
+    for (size_t i = 0; i < sizeof(watch) / sizeof(watch[0]); i++) {
+        if (strstr(cls, watch[i])) return YES;
+    }
+    return NO;
+}
+
+// 去重表：只记「出现过哪些 selector」，不记次数（避免热路径计数开销）
+#define FF_SEL_MAX 128
+static uint32_t gSelSeen[FF_SEL_MAX];
+static int      gSelCnt = 0;
+
+static void ff_noteConnCall(mach_port_t conn, uint32_t selector, const char *api) {
+    const char *cls = ff_connClassOf(conn);
+    if (!ff_shouldWatchConn(cls)) return;
+    for (int i = 0; i < gSelCnt && i < FF_SEL_MAX; i++) {
+        if (gSelSeen[i] == selector) return;             // 已记过
+    }
+    if (gSelCnt >= FF_SEL_MAX) return;
+    gSelSeen[gSelCnt++] = selector;
+    logDiag(@"io-conn %s: %s selector=%u", api, cls, selector);
+}
+
+typedef kern_return_t (*IOConnectCallMethodFn)(mach_port_t, uint32_t,
+                                               const uint64_t *, uint32_t,
+                                               const void *, size_t,
+                                               uint64_t *, uint32_t *,
+                                               void *, size_t *);
+typedef kern_return_t (*IOConnectCallStructMethodFn)(mach_port_t, uint32_t,
+                                                     const void *, size_t,
+                                                     void *, size_t *);
+typedef kern_return_t (*IOConnectCallScalarMethodFn)(mach_port_t, uint32_t,
+                                                     const uint64_t *, uint32_t,
+                                                     uint64_t *, uint32_t *);
+
+static IOConnectCallMethodFn       orig_IOConnectMethod     = NULL;
+static IOConnectCallStructMethodFn orig_IOConnectStructMeth = NULL;
+static IOConnectCallScalarMethodFn orig_IOConnectScalarMeth = NULL;
+
+static kern_return_t hook_IOConnectCallMethod(mach_port_t conn, uint32_t selector,
+                                              const uint64_t *input, uint32_t inputCnt,
+                                              const void *inputStruct, size_t inputStructCnt,
+                                              uint64_t *output, uint32_t *outputCnt,
+                                              void *outputStruct, size_t *outputStructCnt) {
+    @try { ff_noteConnCall(conn, selector, "method"); } @catch (NSException *e) {}
+    return orig_IOConnectMethod
+        ? orig_IOConnectMethod(conn, selector, input, inputCnt, inputStruct, inputStructCnt,
+                               output, outputCnt, outputStruct, outputStructCnt)
+        : KERN_FAILURE;
+}
+
+static kern_return_t hook_IOConnectCallStructMethod(mach_port_t conn, uint32_t selector,
+                                                    const void *inputStruct, size_t inputStructCnt,
+                                                    void *outputStruct, size_t *outputStructCnt) {
+    @try { ff_noteConnCall(conn, selector, "struct"); } @catch (NSException *e) {}
+    return orig_IOConnectStructMeth
+        ? orig_IOConnectStructMeth(conn, selector, inputStruct, inputStructCnt,
+                                   outputStruct, outputStructCnt)
+        : KERN_FAILURE;
+}
+
+static kern_return_t hook_IOConnectCallScalarMethod(mach_port_t conn, uint32_t selector,
+                                                    const uint64_t *input, uint32_t inputCnt,
+                                                    uint64_t *output, uint32_t *outputCnt) {
+    @try { ff_noteConnCall(conn, selector, "scalar"); } @catch (NSException *e) {}
+    return orig_IOConnectScalarMeth
+        ? orig_IOConnectScalarMeth(conn, selector, input, inputCnt, output, outputCnt)
+        : KERN_FAILURE;
+}
+
 // 纯诊断：记录 powerd 打开了哪些 IO service（去重、上限 64）。
 // 目的：判断它是否走 `AppleSmartBatteryManagerUserClient`（IOConnectCallMethod）那
 // 条通道。那条通道我们**只观测不拦截** —— externalMethod 的参数结构未知，
@@ -521,6 +642,8 @@ static kern_return_t hook_IOServiceOpen(io_service_t service, task_port_t owning
         @try {
             io_name_t cls = {0};
             if (IOObjectGetClass(service, cls) == KERN_SUCCESS && cls[0]) {
+                // ⭐ v0.3.0：先登记句柄→类名映射，供 IOConnectCall* 探针反查
+                ff_connRemember(*connect, cls);
                 static NSMutableSet<NSString *> *seen = nil;
                 static dispatch_once_t once;
                 dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
@@ -564,6 +687,22 @@ static void installIOKitHooks(void) {
     if (p3 && !orig_SvcOpen) {
         MSHookFunction(p3, (void *)hook_IOServiceOpen, (void **)&orig_SvcOpen);
     }
+    // ⭐ v0.3.0：user client external method 探针（只观测不拦截）。
+    //   用途：判定 powerd 是否通过 AppleSmartBatteryManager / AppleSMC 的
+    //   external method 下发充电控制 —— 这是「拦 IOKit setter」失效后
+    //   唯一还没被排除的用户态通道。符号不存在则跳过（不同机型/系统可能没有）。
+    void *p4 = dlsym(handle, "IOConnectCallMethod");
+    if (p4 && !orig_IOConnectMethod) {
+        MSHookFunction(p4, (void *)hook_IOConnectCallMethod, (void **)&orig_IOConnectMethod);
+    }
+    void *p5 = dlsym(handle, "IOConnectCallStructMethod");
+    if (p5 && !orig_IOConnectStructMeth) {
+        MSHookFunction(p5, (void *)hook_IOConnectCallStructMethod, (void **)&orig_IOConnectStructMeth);
+    }
+    void *p6 = dlsym(handle, "IOConnectCallScalarMethod");
+    if (p6 && !orig_IOConnectScalarMeth) {
+        MSHookFunction(p6, (void *)hook_IOConnectCallScalarMethod, (void **)&orig_IOConnectScalarMeth);
+    }
     gHookInstalled = (orig_SetCFProp != NULL || orig_SetCFProps != NULL ||
                       orig_SvcSetCFProp != NULL);
 }
@@ -578,14 +717,20 @@ static void installIOKitHooks(void) {
 static void heartbeatTick(void) {
     if (gTickCount % 30 != 0) return;          // 30 × 2s = 60s
     ffRotateLogIfTooBig(diagLogPath());        // 顺带做日志体量治理（不在热路径）
+    // ⭐ v0.3.0：idle 分支也带遥测。
+    //   起因：老板报「76% 就停了不充了」，而当时日志只有一行 charge stop reason，
+    //   无法分辨「他拔线了(ext=0)」还是「线插着系统停充(ext=1)」。放电静置时
+    //   每 60s 带一次 ext/ncr/temp，任何时刻取日志都能一眼判定线在不在、
+    //   系统是不是在限流（vac 被压低 / ncr 非 0）。
     if (gLastCharging) {
         logDiag(@"heartbeat charging pid=%d hooks=%d force=%d %@ sessionBlocked=%d blocked=%d setterCalls=%d",
                 (int)getpid(), gHookInstalled, gForceFastCharge,
                 ffTelemetryLine(readBatteryTelemetry()),
                 gSessionBlocked, gBlockedCount, gSetterCalls);
     } else {
-        logDiag(@"heartbeat idle pid=%d hooks=%d force=%d charging=0 sessionBlocked=%d blocked=%d setterCalls=%d",
+        logDiag(@"heartbeat idle pid=%d hooks=%d force=%d %@ sessionBlocked=%d blocked=%d setterCalls=%d",
                 (int)getpid(), gHookInstalled, gForceFastCharge,
+                ffTelemetryLine(readBatteryTelemetry()),
                 gSessionBlocked, gBlockedCount, gSetterCalls);
     }
 }
@@ -637,9 +782,11 @@ static void settingsChanged(CFNotificationCenterRef center, void *observer,
             logDiag(@"no IOKit setter hooks installed");
             return;
         }
-        logDiag(@"hooks installed (set=%d, setProps=%d, svcSet=%d, svcOpen=%d)",
+        logDiag(@"hooks installed (set=%d, setProps=%d, svcSet=%d, svcOpen=%d, connMethod=%d, connStruct=%d, connScalar=%d)",
                 orig_SetCFProp != NULL, orig_SetCFProps != NULL,
-                orig_SvcSetCFProp != NULL, orig_SvcOpen != NULL);
+                orig_SvcSetCFProp != NULL, orig_SvcOpen != NULL,
+                orig_IOConnectMethod != NULL, orig_IOConnectStructMeth != NULL,
+                orig_IOConnectScalarMeth != NULL);
         writeStatusFile();
 
         // 监听设置变更与充电状态变化（Darwin 通知中心，与上游一致）

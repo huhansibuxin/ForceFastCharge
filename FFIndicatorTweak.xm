@@ -15,6 +15,18 @@
 //    后面一行都不执行。现改用 FFIsProcess（getprogname + 包含匹配），
 //    并用 FFBootLog 无条件落盘，杜绝再出现「注入了却什么都没发生」的黑洞。
 //
+//  ⚠️⚠️ v0.2.2 关键修复：定时器必须由**文件级静态变量**持有强引用（见 gTimer）。
+//
+//  ⚠️⚠️ v0.3.0 关键修复（老板实机：「开了常显，插上还是不显示」）：
+//    根因不是注入、不是开关、不是场景 —— 是**刷新入口的短路顺序**。
+//    refreshIndicator() 里 `if (!forceNotify && !changed) return;` 挡在了
+//    updateWithCharging() 之前，而建窗只发生在 updateWithCharging 里。
+//    SB 刚重启时 scene 未就绪 → 首次建窗失败 → 插着充电器时状态恒稳 →
+//    每 2s 的 tick 全部提前 return → **窗口再没有任何重试机会**，圆点永不出现；
+//    直到某次状态翻转（拔线）才把窗口建出来。
+//    实机证据：charging=1 的 47 秒内仅 2 条 refresh（均 win=0），随后 47 秒静默。
+//    修法：每轮无条件先 ensureWindowAsync()（幂等、非阻塞），再做变化检测。
+//
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -186,6 +198,9 @@ static void writeSbStatus(CGFloat cx, CGFloat cy) {
         @"dotLoaded" : (gEnabled ? @"是" : @"否"),
         @"dotWindow" : ([FFIndicator windowCreated] ? @"已创建" : @"未创建"),
         @"dotState"  : dotState,
+        // ⭐ v0.3.0：窗口细节（层级/隐藏/alpha/frame/是否挂到 scene）——
+        // 直接在手机上就能区分「逻辑判定不显示」与「建了却看不见」，不必先 SSH。
+        @"dotDiag"   : [FFIndicator diagLine],
     };
     FFWriteDomainPlist(@"sbstatus", domain);
 
@@ -209,6 +224,17 @@ static void writeSbStatus(CGFloat cx, CGFloat cy) {
 
 // ---------------------------------------------------------------- 刷新驱动
 static void refreshIndicator(BOOL forceNotify) {
+    // ⭐⭐ v0.3.0 关键修复（老板实机：「开了常显，插上还是不显示」）
+    //   必须在**状态变化检测之前**无条件请求建窗。
+    //   根因链：建窗只发生在 updateWithCharging 里 → 而这里"无变化就 return" →
+    //   SB 刚重启时场景未就绪导致首次建窗失败后，插着充电器状态恒稳，
+    //   每 2s 的 tick 全部提前 return，**窗口再没有任何重试机会**
+    //   → 插上充电器几十分钟都不出圆点，直到某次状态翻转（拔线）才把窗口建出来。
+    //   实机证据：sb.log 中 charging=1 的 47 秒里仅 2 条 refresh（均 win=0），
+    //   之后 47 秒静默；1791186123（拔线，charging 1→0）那一帧才出现 win=1。
+    //   ensureWindowAsync 内部幂等 + 自带主线程切换 + 不阻塞，代价可忽略。
+    [[FFIndicator shared] ensureWindowAsync];
+
     BOOL force    = readBool(kFFForceFastChargeKey, NO);
     BOOL charging = readCharging();
     BOOL active   = readForceActive();     // 我们这一轮充电有没有真拦下系统停充 → 决定红/绿
@@ -224,15 +250,17 @@ static void refreshIndicator(BOOL forceNotify) {
     gLastCharging = charging; gLastActive = active;
     gLastMode = mode; gLastX = cx; gLastY = cy;
 
-    if (!forceNotify && !changed) return;   // 无变化不打扰
+    if (!forceNotify && !changed) return;   // 无变化不打扰（窗口仍在每轮 ensureWindowAsync 里保活）
 
-    // win=窗口对象是否存在；vis=窗口是否真的可见（已创建且未 hidden）。
-    // 排查「圆点不亮」时：vis=1 却看不见 ⇒ 被遮挡/坐标在屏外；
-    //                    vis=0 且 charging=1、mode=1 ⇒ 逻辑要显示但窗口被隐藏。
-    sbLog(@"refresh force=%d charging=%d active=%d mode=%ld coord=(%.1f,%.1f) win=%d vis=%d scene=%ld",
+    // win=窗口对象是否存在；vis=窗口是否真的可见（已创建且未 hidden）；
+    // scene=主线程缓存的场景激活态；diag=窗口层级/frame/是否挂到 scene 等细节。
+    // 排查「圆点不亮」的三段判据：
+    //   vis=0 且 charging=1、mode=1 ⇒ 逻辑要显示但窗口被隐藏/建不出来
+    //   vis=1 却看不见              ⇒ 看 diag 的 lvl/fr（被遮挡 / 坐标出屏）
+    sbLog(@"refresh force=%d charging=%d active=%d mode=%ld coord=(%.1f,%.1f) win=%d vis=%d scene=%ld [%@]",
           force, charging, active, (long)mode, cx, cy,
           [FFIndicator windowCreated], [FFIndicator windowVisible],
-          (long)[FFIndicator sceneState]);
+          (long)[FFIndicator sceneState], [FFIndicator diagLine]);
 
     [[FFIndicator shared] updateWithCharging:charging active:active mode:mode];
     writeSbStatus(cx, cy);
@@ -311,9 +339,10 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
                     gTick++;
                     if (gTick % 30 == 0) {
                         sbRotateIfTooBig();
-                        sbLog(@"heartbeat pid=%d win=%d vis=%d scene=%ld force=%d charging=%d active=%d mode=%ld",
+                        sbLog(@"heartbeat pid=%d win=%d vis=%d scene=%ld [%@] force=%d charging=%d active=%d mode=%ld",
                               (int)getpid(), [FFIndicator windowCreated],
                               [FFIndicator windowVisible], (long)[FFIndicator sceneState],
+                              [FFIndicator diagLine],
                               gLastForce, gLastCharging, gLastActive, (long)gLastMode);
                     }
                     refreshIndicator(NO);
