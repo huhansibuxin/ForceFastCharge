@@ -168,6 +168,37 @@ charge stop reason: cap=92% mA=0 mV=4371 vac=4360 ncr=132 thermal=0 ext=1 temp=4
 | `sessionBlocked>0` 或日志里有 `BLOCK stop-charge` | 系统本来要停充，**被我们拦住了** → 圆点该是红的 |
 | `thermal>0` | 温控介入过（累计秒数），说明是温度触发的限流 |
 
+### 圆点不随插拔充电器刷新？先看心跳有没有打出来
+
+v0.2.2 修掉了一个**完全静默**的根因：两侧的 2s 轮询定时器
+（`dispatch_source_t`）此前声明为 `%ctor` 内的**局部变量** ——
+ARC 下它在离开作用域时被 release，libdispatch 随即 cancel 掉这个已
+`dispatch_resume` 的 source，定时器**永久失效，不崩溃、不报错、无日志**。
+
+后果（v0.2.1 实机现象）：唯一还能刷新圆点的通路退化成
+「用户在设置页操作 → Darwin 通知 → 两侧被唤起」，于是表现为
+**插上充电器圆点不亮、拔掉也不灭，点一下设置页（应用位置）才更新**。
+
+现在改为**文件级静态变量**持有强引用（block 内不捕获它，无循环引用）。
+验证方法（插拔充电器后最多等 2s）：
+
+```bash
+ssh root@192.168.3.156 'tail -20 /rootfs/private/var/mobile/Documents/ForceFastCharge/sb.log'
+```
+
+| 观察 | 结论 |
+|---|---|
+| `heartbeat ... vis=1 scene=1` | 定时器与圆点窗口都正常（1 行/分钟） |
+| `refresh ... charging=1 vis=1` | 插电后圆点已显示 |
+| `refresh ... charging=0` | 拔线后圆点已隐藏 |
+| `vis=0` 但 `charging=1`、`mode=1` | 逻辑要显示但窗口被隐藏 —— 视为异常，需进一步查 |
+| 连 `heartbeat` 都没有 | 定时器仍未工作（`scene` 值也会一并给出，便于判断场景是否不活跃） |
+
+> ⚠️ 同类陷阱：ARC + GCD 定时器**必须**由 `static` / ivar 持有强引用。
+> 写成局部变量在模拟器/单次调用里可能"看起来正常"（恰好没被回收），
+> 在常驻进程里则表现为"功能时好时坏或干脆全无"。排查此类问题时，
+> 第一件事就是**确认心跳/日志里的"定期"输出到底有没有**。
+
 ## 构建
 
 - rootless：`make package`

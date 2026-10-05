@@ -27,6 +27,17 @@
 // 窗口是否已成功创建（供设置页/状态文件判断「dylib 跑了但窗口建不出来」）
 // 注意：只读指针，后台线程调用安全。
 + (BOOL)windowCreated;
+// 窗口是否**真正可见**（已创建且未被 hidden）。
+// 为什么单列：windowCreated=YES 只说明窗口对象存在；若它处于 hidden=YES，
+// 则逻辑上"该显示"但屏幕上什么都看不到。这两种情况必须能区分，
+// 否则排查「圆点不亮」时又得在"逻辑判定"与"窗口可见性"之间反复猜。
+// 只读 BOOL，后台线程调用安全。
++ (BOOL)windowVisible;
+// 当前 scene 的 activationState（1=ForegroundActive 2=ForegroundInactive
+// 3=Background 4=Unattached；读不到场景返回 0）。
+// 场景不在 ForegroundActive 时 ensureWindow 会拒绝建窗 → 圆点建不出来，
+// 单列此值用于一眼确认「窗口建不出来」是不是场景状态造成的。
++ (NSInteger)sceneState;
 // 依据当前状态更新圆点：显示/隐藏 + 颜色
 //   charging: 是否正在充电（为 NO 时两个模式都不显示）
 //   active  : 我们的强制充电这一轮有没有真的拦下系统停充（sessionBlocked > 0）
@@ -81,6 +92,15 @@ static CGFloat ff_coord(NSString *key, CGFloat def) {
 
 + (BOOL)windowCreated {
     return (g_win != nil);
+}
+
++ (BOOL)windowVisible {
+    return (g_win != nil && !g_win.hidden);
+}
+
++ (NSInteger)sceneState {
+    UIWindowScene *ws = ff_currentScene();
+    return ws ? (NSInteger)ws.activationState : 0;
 }
 
 - (void)ensureWindow {

@@ -83,6 +83,19 @@ static int gSetterCalls = 0;      // hook 被调用的总次数（诊断：证�
 static BOOL gLastCharging = NO;   // 当前充电状态，供状态文件与指示器读取
 static uint64_t gTickCount = 0;   // 2s 轮询 tick 计数（v0.2.1：每 30 tick = 60s 发一次心跳）
 
+// ⚠️⚠️ v0.2.2 关键修复：定时器必须由**文件级静态变量**持有强引用。
+//   ARC 下 dispatch_source_t 是托管对象；若只存在于 %ctor 的局部变量中，
+//   离开作用域即被 release → libdispatch 对「已 resume 的 source」会自动 cancel
+//   → 定时器**永久失效**，且完全静默（不 crash、不报错）。
+//
+//   实机铁证（v0.2.1，2026-10-05）：
+//     · ffcharge.log / sb.log 跨数小时、heartbeat 均为 0 次 —— handler 从未执行；
+//     · 但日志里确实出现过 charging state -> YES/NO —— 那是**通知回调**打的，
+//       即唯一还能工作的通路退化成「用户在设置页操作 → 发通知 → 两侧被唤起」。
+//     · 于是表现为老板观察到的：「插拔充电器圆点不刷新，点一下设置才更新」。
+//   修法：静态强引用持有（block 里不捕获它，故无循环引用）。
+static dispatch_source_t gTimer = nil;
+
 // ---------------------------------------------------------------- 诊断日志
 static NSString *diagLogPath(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -644,15 +657,17 @@ static void settingsChanged(CFNotificationCenterRef center, void *observer,
         updateChargeState();
 
         // 兜底轮询：偏好改动通知可能丢失，2s 复查一次开关
-        dispatch_source_t timer = dispatch_source_create(
+        // ⚠️ 必须存进文件级静态 gTimer（见其声明处的说明）——
+        //    写成局部变量会被 ARC 提前释放，定时器静默失效（v0.2.1 实机踩坑）。
+        gTimer = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-        if (timer) {
-            dispatch_source_set_timer(timer,
+        if (gTimer) {
+            dispatch_source_set_timer(gTimer,
                                       dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                                       2 * NSEC_PER_SEC,
                                       300 * NSEC_PER_SEC / 1000);   // 300ms leeway
-            dispatch_source_set_event_handler(timer, ^{
+            dispatch_source_set_event_handler(gTimer, ^{
                 if (gHookInstalled) {
                     gTickCount++;
                     updateChargeState();
@@ -660,7 +675,7 @@ static void settingsChanged(CFNotificationCenterRef center, void *observer,
                     heartbeatTick();     // v0.2.1：60s 一次存活心跳（含充电遥测）
                 }
             });
-            dispatch_resume(timer);
+            dispatch_resume(gTimer);
         }
     }
 }

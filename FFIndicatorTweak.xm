@@ -34,6 +34,15 @@ static CGFloat gLastX = -1, gLastY = -1;   // 坐标也要纳入变化检测，�
 static BOOL gEnabled      = NO;   // 是否成功进入运行态
 static uint64_t gTick      = 0;   // 2s tick 计数（v0.2.1：每 30 tick = 60s 一次心跳）
 
+// ⚠️⚠️ v0.2.2 关键修复：定时器必须由**文件级静态变量**持有强引用。
+//   ARC 下 dispatch_source_t 是托管对象；写成 %ctor 的局部变量，离开作用域即被
+//   release → libdispatch 对「已 resume 的 source」自动 cancel → 定时器永久失效
+//   （完全静默：不 crash、不报错、无任何日志）。
+//   实机铁证（v0.2.1）：sb.log 跨越约 2 小时、heartbeat 0 次；唯一还能刷新圆点的
+//   通路退化成「用户在设置页操作所发的 Darwin 通知」—— 这就是老板观察到的
+//   「插上充电器不亮、拔掉不灭，点一下设置页（应用位置）才更新」的根因。
+static dispatch_source_t gTimer = nil;
+
 // ---------------------------------------------------------------- 诊断日志
 // SpringBoard 侧此前完全没有日志，出问题只能盲猜，这里补全。
 static void sbLog(NSString *fmt, ...) {
@@ -217,8 +226,13 @@ static void refreshIndicator(BOOL forceNotify) {
 
     if (!forceNotify && !changed) return;   // 无变化不打扰
 
-    sbLog(@"refresh force=%d charging=%d active=%d mode=%ld coord=(%.1f,%.1f) win=%d",
-          force, charging, active, (long)mode, cx, cy, [FFIndicator windowCreated]);
+    // win=窗口对象是否存在；vis=窗口是否真的可见（已创建且未 hidden）。
+    // 排查「圆点不亮」时：vis=1 却看不见 ⇒ 被遮挡/坐标在屏外；
+    //                    vis=0 且 charging=1、mode=1 ⇒ 逻辑要显示但窗口被隐藏。
+    sbLog(@"refresh force=%d charging=%d active=%d mode=%ld coord=(%.1f,%.1f) win=%d vis=%d scene=%ld",
+          force, charging, active, (long)mode, cx, cy,
+          [FFIndicator windowCreated], [FFIndicator windowVisible],
+          (long)[FFIndicator sceneState]);
 
     [[FFIndicator shared] updateWithCharging:charging active:active mode:mode];
     writeSbStatus(cx, cy);
@@ -277,29 +291,35 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
         }
 
         // ⑥ 2s 兜底轮询：覆盖通知丢失 / 设置页改坐标不触发通知等情况
-        dispatch_source_t timer = dispatch_source_create(
+        // ⚠️ 必须存进文件级静态 gTimer（见其声明处说明）——
+        //    写成局部变量会被 ARC 提前释放，定时器静默失效，圆点只剩
+        //    「用户操作设置页」这一条刷新通路（v0.2.1 实机踩坑的根因）。
+        gTimer = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-        if (timer) {
-            dispatch_source_set_timer(timer,
+        if (gTimer) {
+            dispatch_source_set_timer(gTimer,
                                       dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                                       2 * NSEC_PER_SEC,
                                       300 * NSEC_PER_SEC / 1000);   // 300ms leeway
-            dispatch_source_set_event_handler(timer, ^{
+            dispatch_source_set_event_handler(gTimer, ^{
                 @try {
                     // v0.2.1：60s 存活心跳。refreshIndicator 在"无变化"时是不写日志的
                     // （纯事件驱动），日志静止会让人以为插件死了 —— 心跳解决这个歧义。
+                    // v0.2.2：心跳额外记录 vis / scene，用于区分
+                    //   「逻辑判定不该显示」与「逻辑要显示但窗口被隐藏 / 建不出来」。
                     gTick++;
                     if (gTick % 30 == 0) {
                         sbRotateIfTooBig();
-                        sbLog(@"heartbeat pid=%d win=%d force=%d charging=%d active=%d mode=%ld",
-                              (int)getpid(), [FFIndicator windowCreated], gLastForce,
-                              gLastCharging, gLastActive, (long)gLastMode);
+                        sbLog(@"heartbeat pid=%d win=%d vis=%d scene=%ld force=%d charging=%d active=%d mode=%ld",
+                              (int)getpid(), [FFIndicator windowCreated],
+                              [FFIndicator windowVisible], (long)[FFIndicator sceneState],
+                              gLastForce, gLastCharging, gLastActive, (long)gLastMode);
                     }
                     refreshIndicator(NO);
                 } @catch (NSException *e) {}
             });
-            dispatch_resume(timer);
+            dispatch_resume(gTimer);
         }
     }
 }
