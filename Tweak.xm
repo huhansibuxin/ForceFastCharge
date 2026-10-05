@@ -99,6 +99,7 @@ static void writeStatusFile(void) {
     [[NSFileManager defaultManager] createDirectoryAtPath:dir                             \
                              withIntermediateDirectories:YES                                          \
                                               attributes:nil error:nil];
+    NSString *nowStr = [[NSDate date] description];
     NSDictionary *st = @{
         @"hookInstalled"     : @(gHookInstalled),
         @"forceEnabled"      : @(gForceFastCharge),
@@ -106,7 +107,7 @@ static void writeStatusFile(void) {
         @"charging"          : @(gLastCharging),
         @"pid"               : @((int)getpid()),
         @"blockedWriteCount" : @(gBlockedCount),
-        @"updatedAt"         : @([[NSDate date] description])
+        @"updatedAt"         : nowStr
     };
     [st writeToFile:FFStatusPath() atomically:YES];
 }
@@ -278,11 +279,14 @@ static void installIOKitHooks(void) {
     gHookInstalled = (orig_SetCFProp != NULL || orig_SvcSetCFProp != NULL);
 }
 
-static void settingsChanged(CFNotificationCenterRef center, void *observer,
-                            CFNotificationName name, const void *object,
-                            CFDictionaryRef userInfo) {
-    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
-    if (gHookInstalled) updateChargeState();
+// Darwin 通知回调（notify_add_observer 形态，非 CFNotificationCenter 形态）
+static void pollChargeState(void);   // 前置声明
+static void settingsChanged(int token, void *value, void *context) {
+    (void)token; (void)value; (void)context;
+    if (gHookInstalled) {
+        updateChargeState();
+        pollChargeState();
+    }
 }
 
 #pragma mark - ctor
@@ -301,11 +305,14 @@ static void settingsChanged(CFNotificationCenterRef center, void *observer,
                 orig_SetCFProp != NULL, orig_SvcSetCFProp != NULL);
         writeStatusFile();
 
-        CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
-        if (center) {
-            CFNotificationCenterAddObserver(center, NULL, settingsChanged,
-                                             FFSettingsChangedNotif, NULL,
-                                             CFNotificationSuspensionBehaviorDeliverImmediately);
+        // 监听设置变更与充电状态变化（Darwin 通知，与指示点侧同机制）
+        int setToken = -1;
+        if (notify_register_check(FFSettingsChangedNotif, &setToken) == NOTIFY_STATUS_OK) {
+            notify_add_observer(setToken, settingsChanged, NULL, NULL, NULL);
+        }
+        int stateToken = -1;
+        if (notify_register_check(FFChargeStateNotif, &stateToken) == NOTIFY_STATUS_OK) {
+            notify_add_observer(stateToken, settingsChanged, NULL, NULL, NULL);
         }
         updateChargeState();
 
@@ -317,7 +324,7 @@ static void settingsChanged(CFNotificationCenterRef center, void *observer,
             dispatch_source_set_timer(timer,
                                       dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                                       2 * NSEC_PER_SEC,
-                                      300 * NSEC_MSEC);
+                                      300 * NSEC_PER_SEC / 1000);   // 300ms leeway
             dispatch_source_set_event_handler(timer, ^{
                 if (gHookInstalled) {
                     updateChargeState();
