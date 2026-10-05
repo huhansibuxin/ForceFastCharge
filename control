@@ -1,0 +1,9 @@
+Package: com.chargecontrol.ff
+Name: ForceFastCharge
+Author: huhansibuxin
+Description: 强制快充单功能版：阻止系统下调充电电流/功率上限（仅注入 powerd）。移植自 mowang7426/sbcpu 的 SBCPUPowerd.xm，不含限充。
+Depends: mobilesubstrate, preferenceloader
+Maintainer: huhansibuxin
+Section: Tweaks
+Architecture: iphoneos-arm
+Version: 0.1.0

@@ -1,0 +1,13 @@
+#!/bin/sh
+case "$1" in
+remove|purge)
+# 卸载时清理诊断日志与状态文件
+rm -f /var/mobile/ForceFastCharge/ffcharge.log 2>/dev/null || true
+rm -f /var/mobile/ForceFastCharge/status.plist 2>/dev/null || true
+rmdir /var/mobile/ForceFastCharge 2>/dev/null || true
+# 重启相关进程，摘除已注入的 tweak
+killall -9 powerd 2>/dev/null || true
+killall -9 SpringBoard 2>/dev/null || true
+;;
+esac
+exit 0

@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>title</key>
+	<string>强制快充</string>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>cell</key><string>PSGroupCell</string>
+			<key>label</key><string>强制快充</string>
+			<key>footerText</key><string>阻止系统把充电电流/功率上限往下压（ChargeCurrentLimit、MaxChargeCurrent、AdapterPowerLimit、USBPD* 等），让充电速度由充电器协商与电池 BMS 决定。不修改电池状态、不解除原厂温度保护。</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSSwitchCell</string>
+			<key>default</key><false/>
+			<key>defaults</key><string>com.chargecontrol</string>
+			<key>key</key><string>forceChargeEnabled</string>
+			<key>label</key><string>强制快充</string>
+		</dict>
+
+		<!-- ===================== 指示点 ===================== -->
+		<dict>
+			<key>cell</key><string>PSGroupCell</string>
+			<key>label</key><string>状态指示点</string>
+			<key>footerText</key><string>在灵动岛右侧显示一个小圆点，实时反映强制快充状态。颜色含义：蓝=正在充电，绿色=强制快充生效中(未充电)，红色=强制快充+温控覆盖(高风险)。坐标可自定义，留空或 0 则使用默认位置。</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSSegmentCell</string>
+			<key>default</key><integer>0</integer>
+			<key>defaults</key><string>com.chargecontrol</string>
+			<key>key</key><string>indicatorShowMode</string>
+			<key>label</key><string>显示模式</string>
+			<key>validTitles</key><array><string>自动</string><string>常显</string><string>仅强制</string><string>关闭</string></array>
+			<key>validValues</key><array><integer>0</integer><integer>1</integer><integer>2</integer><integer>3</integer></array>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSGroupCell</string>
+			<key>label</key><string>圆点位置</string>
+			<key>footerText</key><string>横坐标（dotX）与纵坐标（dotY）以 pt 为单位，对应圆点中心。默认 X=294 / Y=29.4（灵动岛右侧）。填 0 或留空则回退默认值，避免圆点飞出屏幕。</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSSliderCell</string>
+			<key>default</key><real>294.0</real>
+			<key>defaults</key><string>com.chargecontrol</string>
+			<key>key</key><string>dotX</string>
+			<key>label</key><string>横坐标 X</string>
+			<key>min</key><real>0.0</real>
+			<key>max</key><real>430.0</real>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSSliderCell</string>
+			<key>default</key><real>29.4</real>
+			<key>defaults</key><string>com.chargecontrol</string>
+			<key>key</key><string>dotY</string>
+			<key>label</key><string>纵坐标 Y</string>
+			<key>min</key><real>0.0</real>
+			<key>max</key><real>100.0</real>
+		</dict>
+
+		<!-- ===================== 运行状态 ===================== -->
+		<dict>
+			<key>cell</key><string>PSGroupCell</string>
+			<key>label</key><string>运行状态</string>
+			<key>footerText</key><string>数据来自注入 powerd 的本插件。tweakLoaded=否 说明 dylib 未注入 powerd；blockedWrites 持续增长代表确实在拦截降流。</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSValueCell</string>
+			<key>defaults</key><string>com.chargecontrol.ffstatus</string>
+			<key>key</key><string>loaded</string>
+			<key>label</key><string>tweakLoaded</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSValueCell</string>
+			<key>defaults</key><string>com.chargecontrol.ffstatus</string>
+			<key>key</key><string>blocked</string>
+			<key>label</key><string>blockedWrites</string>
+		</dict>
+
+		<!-- ===================== 高温强制（高风险，默认关） ===================== -->
+		<dict>
+			<key>cell</key><string>PSGroupCell</string>
+			<key>label</key><string>高温强制</string>
+			<key>footerText</key><string>⚠️ 高风险：上面「强制快充」只拦系统软件层降流，机身过热时 iOS 仍会通过温控派生键（ThermalMaxChargeCurrent 等）停止充电——这是原厂安全保护。打开本开关会一并吞掉温控指令，设备将不再自行停止充电，可能因过热触发强制关机（黑屏）并加速电池老化。仅在你明确接受该风险时开启。</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSSwitchCell</string>
+			<key>default</key><false/>
+			<key>defaults</key><string>com.chargecontrol</string>
+			<key>key</key><string>forceThermalOverrideEnabled</string>
+			<key>label</key><string>强制覆盖温控降流（可能黑屏）</string>
+		</dict>
+
+		<dict>
+			<key>cell</key><string>PSGroupCell</string>
+			<key>label</key><string>效果边界</string>
+			<key>footerText</key><string>充电速度最终由充电器额定功率、线材规格、电池 BMS 与机身温度共同决定。本插件只保证「系统不主动往下压电流上限」，无法突破充电器功率天花板。诊断日志：/var/mobile/ForceFastCharge/ffcharge.log（安装或升级时自动清除）。</string>
+		</dict>
+	</array>
+</dict>
+</plist>
