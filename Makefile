@@ -11,7 +11,7 @@ include $(THEOS)/makefiles/common.mk
 # 不配置 INSTALL_TARGET_PROCESSES；安装/升级由 postinst 单独重启 powerd。
 export ARCHS = arm64 arm64e
 
-# ---------- 1) 强制快充核心：仅注入 powerd，吞掉系统降流写 ----------
+# ---------- 1) 强制充电核心：仅注入 powerd，拦下系统「停充/断流」写入 ----------
 TWEAK_NAME = ForceFastCharge
 ForceFastCharge_FILES = Tweak.xm
 ForceFastCharge_CFLAGS = -fobjc-arc -Iinclude -Wno-deprecated-declarations -fvisibility=hidden

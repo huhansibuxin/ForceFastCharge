@@ -11,7 +11,7 @@ rm -f /tmp/ff_boot.log     2>/dev/null || true
 # 清除状态域文件（roothide 下位于 jbroot 的 Preferences 目录，随机串用通配符匹配）
 rm -f /var/mobile/Containers/Shared/AppGroup/.jbroot-*/var/mobile/Library/Preferences/com.chargecontrol.ffstatus.plist 2>/dev/null || true
 rm -f /var/mobile/Containers/Shared/AppGroup/.jbroot-*/var/mobile/Library/Preferences/com.chargecontrol.sbstatus.plist 2>/dev/null || true
-# 重启 powerd，让强制快充核心注入生效
+# 重启 powerd，让强制充电核心（拦停充）注入生效
 killall -9 powerd 2>/dev/null || true
 # 重启 SpringBoard 让指示点注入生效。
 # ⚠️ 必须用 -10(SIGTERM) 而非 -9：SpringBoard 对 SIGKILL 处理不当，
