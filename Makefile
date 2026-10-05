@@ -22,7 +22,7 @@ ForceFastCharge_LIBRARIES = substrate
 TWEAK_NAME += ForceFastChargeIndicator
 ForceFastChargeIndicator_FILES = FFIndicatorTweak.xm
 ForceFastChargeIndicator_CFLAGS = -fobjc-arc -Iinclude -Wno-deprecated-declarations -fvisibility=hidden
-ForceFastChargeIndicator_FRAMEWORKS = Foundation UIKit CoreFoundation
+ForceFastChargeIndicator_FRAMEWORKS = Foundation UIKit CoreFoundation IOKit
 ForceFastChargeIndicator_LIBRARIES = substrate
 
 # ---------- 3) 设置面板 ----------

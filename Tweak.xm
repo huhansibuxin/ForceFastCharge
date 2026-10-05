@@ -28,6 +28,7 @@
 #import <mach/mach.h>
 #import <substrate.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -294,10 +295,31 @@ static void settingsChanged(CFNotificationCenterRef center, void *observer,
 #pragma mark - ctor
 %ctor {
     @autoreleasepool {
-        NSString *process = [NSProcessInfo processInfo].processName;
-        if (![process isEqualToString:@"powerd"]) return;   // 只注入 powerd
+        // ① 先落盘：纯 POSIX，不依赖 ObjC 运行时。
+        //    只要 dylib 被加载就一定留下痕迹（含真实进程名），
+        //    避免再出现「CocoaTop 看得到 dylib、却零日志零功能」的黑洞。
+        FFBootLog("FF-powerd-ctor");
 
-        logDiag(@"=== boot pid=%d ===", (int)getpid());
+        // ①' kill-switch：SSH 下 touch /var/mobile/ForceFastCharge/disable 即可让本
+        //      dylib 完全空跑（不挂任何 hook），用于异常时的快速止血。
+        if (access("/var/mobile/ForceFastCharge/disable", F_OK) == 0) {
+            logDiag(@"kill-switch 命中 → 不挂 hook");
+            return;
+        }
+
+        // ② 进程判定：FFIsProcess 用 getprogname + 包含匹配。
+        //    ⚠️ 不能用 isEqualToString（v0.1.x 全盘失效根因：
+        //    守护进程的 processName 未必等于短名，判 false 直接 return）。
+        NSString *prog  = FFProcName();
+        NSString *pname = [NSProcessInfo processInfo].processName;
+        if (!FFIsProcess(@"powerd")) {
+            logDiag(@"ctor: 非 powerd（progname=%@ processName=%@）→ 不挂 hook",
+                    prog, pname);
+            return;
+        }
+
+        logDiag(@"=== boot pid=%d progname=%@ processName=%@ ===",
+                (int)getpid(), prog, pname);
         installIOKitHooks();
         if (!gHookInstalled) {
             logDiag(@"no IOKit setter hooks installed");

@@ -20,6 +20,9 @@
 
 @interface FFIndicator : NSObject
 + (instancetype)shared;
+// 窗口是否已成功创建（供设置页/状态文件判断「dylib 跑了但窗口建不出来」）
+// 注意：只读指针，后台线程调用安全。
++ (BOOL)windowCreated;
 // 依据当前状态更新圆点：显示/隐藏 + 颜色
 // charging: 当前是否正在充电；forceOn: 强制快充是否开启；thermalOn: 温控覆盖是否开启
 - (void)updateWithForceOn:(BOOL)forceOn
@@ -68,6 +71,10 @@ static CGFloat ff_coord(NSString *key, CGFloat def) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ inst = [[FFIndicator alloc] init]; });
     return inst;
+}
+
++ (BOOL)windowCreated {
+    return (g_win != nil);
 }
 
 - (void)ensureWindow {
