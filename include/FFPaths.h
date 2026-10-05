@@ -31,9 +31,11 @@ static const CGFloat kFFDotXDefault = 294.0;
 static const CGFloat kFFDotYDefault = 29.4;
 
 // 设置变更 Darwin 通知（设置页 post，powerd 侧监听即时生效）
-static const char *FFSettingsChangedNotif = "com.chargecontrol/settingsChanged";
+// ⚠️ 必须是 CFStringRef —— CFNotificationCenterAddObserver 要 CFStringRef，
+//    notify_post 接受 const char*，两者可由同一字面量分别包装。
+static NSString *const FFSettingsChangedNotifName = @"com.chargecontrol/settingsChanged";
 // 充电状态变化通知（powerd 侧 post，SpringBoard 侧监听以更新指示点）
-static const char *FFChargeStateNotif = "com.chargecontrol/chargeStateChanged";
+static NSString *const FFChargeStateNotifName = @"com.chargecontrol/chargeStateChanged";
 
 // 诊断日志路径（安装/升级时由 postinst 清除，保证每次测试干净开始）
 static NSString *FFLogDir(void) {

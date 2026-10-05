@@ -130,7 +130,7 @@ static void updateChargeState(void) {
     }
     writeStatusFile();
     // 开关变化 → 通知 SpringBoard 侧立即刷新指示点
-    notify_post(FFChargeStateNotif);
+    notify_post(FFChargeStateNotifName.UTF8String);
 }
 
 // ---------------------------------------------------------------- 充电状态
@@ -165,7 +165,7 @@ static void pollChargeState(void) {
     gLastCharging = charging;
     logDiag(@"charging state -> %@", charging ? @"YES" : @"NO");
     writeStatusFile();                       // 让指示器读到最新 charging
-    notify_post(FFChargeStateNotif);
+    notify_post(FFChargeStateNotifName.UTF8String);
 }
 
 // ---------------------------------------------------------------- 属性分类
@@ -279,10 +279,12 @@ static void installIOKitHooks(void) {
     gHookInstalled = (orig_SetCFProp != NULL || orig_SvcSetCFProp != NULL);
 }
 
-// Darwin 通知回调（notify_add_observer 形态，非 CFNotificationCenter 形态）
+// Darwin 通知回调（CFNotificationCenter 形态，对齐上游 SBCPUPowerd.xm 签名）
 static void pollChargeState(void);   // 前置声明
-static void settingsChanged(int token, void *value, void *context) {
-    (void)token; (void)value; (void)context;
+static void settingsChanged(CFNotificationCenterRef center, void *observer,
+                            CFNotificationName name, const void *object,
+                            CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
     if (gHookInstalled) {
         updateChargeState();
         pollChargeState();
@@ -305,14 +307,17 @@ static void settingsChanged(int token, void *value, void *context) {
                 orig_SetCFProp != NULL, orig_SvcSetCFProp != NULL);
         writeStatusFile();
 
-        // 监听设置变更与充电状态变化（Darwin 通知，与指示点侧同机制）
-        int setToken = -1;
-        if (notify_register_check(FFSettingsChangedNotif, &setToken) == NOTIFY_STATUS_OK) {
-            notify_add_observer(setToken, settingsChanged, NULL, NULL, NULL);
-        }
-        int stateToken = -1;
-        if (notify_register_check(FFChargeStateNotif, &stateToken) == NOTIFY_STATUS_OK) {
-            notify_add_observer(stateToken, settingsChanged, NULL, NULL, NULL);
+        // 监听设置变更与充电状态变化（Darwin 通知中心，与上游一致）
+        CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
+        if (center) {
+            CFNotificationCenterAddObserver(center, NULL, settingsChanged,
+                                             (__bridge CFStringRef)FFSettingsChangedNotifName,
+                                             NULL,
+                                             CFNotificationSuspensionBehaviorDeliverImmediately);
+            CFNotificationCenterAddObserver(center, NULL, settingsChanged,
+                                             (__bridge CFStringRef)FFChargeStateNotifName,
+                                             NULL,
+                                             CFNotificationSuspensionBehaviorDeliverImmediately);
         }
         updateChargeState();
 

@@ -15,15 +15,15 @@
 // 开关变化立即通知 powerd 侧生效（powerd 监听该 Darwin 通知）
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
     [super setPreferenceValue:value specifier:specifier];
-    notify_post(FFSettingsChangedNotif);
+    notify_post(FFSettingsChangedNotifName.UTF8String);
     // 通知 SpringBoard 侧指示点刷新（坐标/模式/开关都可能变了）
-    notify_post(FFChargeStateNotif);
+    notify_post(FFChargeStateNotifName.UTF8String);
     [self refreshStatusRows];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
-    notify_post(FFSettingsChangedNotif);
+    notify_post(FFSettingsChangedNotifName.UTF8String);
 }
 
 - (void)viewDidLoad {

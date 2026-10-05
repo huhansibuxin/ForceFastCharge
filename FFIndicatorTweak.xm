@@ -18,7 +18,6 @@
 static BOOL gLastForce = NO;
 static BOOL gLastThermal = NO;
 static BOOL gLastCharging = NO;
-static int gNotifyToken = -1;
 
 static BOOL readBool(NSString *key, BOOL def) {
     @try {
@@ -70,12 +69,17 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
         refreshIndicator(YES);
 
         // 监听 powerd 的充电状态 / 开关变化通知
-        notify_register_check(FFChargeStateNotif, &gNotifyToken);
-        notify_add_observer(gNotifyToken, stateChanged, NULL, NULL, NULL);
-        // 设置页改开关也会 post settingsChanged，这里一并监听
-        int setToken = -1;
-        notify_register_check(FFSettingsChangedNotif, &setToken);
-        notify_add_observer(setToken, stateChanged, NULL, NULL, NULL);
+        CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
+        if (center) {
+            CFNotificationCenterAddObserver(center, NULL, stateChanged,
+                                             (__bridge CFStringRef)FFChargeStateNotifName,
+                                             NULL,
+                                             CFNotificationSuspensionBehaviorDeliverImmediately);
+            CFNotificationCenterAddObserver(center, NULL, stateChanged,
+                                             (__bridge CFStringRef)FFSettingsChangedNotifName,
+                                             NULL,
+                                             CFNotificationSuspensionBehaviorDeliverImmediately);
+        }
 
         // 2s 兜底轮询：覆盖通知丢失 / 状态文件写入竞态
         dispatch_source_t timer = dispatch_source_create(
@@ -85,7 +89,7 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
             dispatch_source_set_timer(timer,
                                       dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                                       2 * NSEC_PER_SEC,
-                                      300 * NSEC_MSEC);
+                                      300 * NSEC_PER_SEC / 1000);   // 300ms leeway
             dispatch_source_set_event_handler(timer, ^{ refreshIndicator(NO); });
             dispatch_resume(timer);
         }
