@@ -2,3 +2,4 @@
 packages/
 *.deb
 .DS_Store
+build_scripts/
