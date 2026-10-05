@@ -6,8 +6,10 @@ rm -f /var/mobile/ForceFastCharge/ffcharge.log 2>/dev/null || true
 rm -f /var/mobile/ForceFastCharge/status.plist 2>/dev/null || true
 # 重启 powerd，让强制快充核心注入生效
 killall -9 powerd 2>/dev/null || true
-# 重启 SpringBoard，让状态指示点注入生效
-killall -9 SpringBoard 2>/dev/null || true
+# 重启 SpringBoard 让指示点注入生效。
+# ⚠️ 必须用 -10(SIGTERM) 而非 -9：SpringBoard 对 SIGKILL 处理不当，
+#    被 -9 强杀后下次启动可能立刻崩溃 → 黑屏且需手动注销才恢复。
+killall -10 SpringBoard 2>/dev/null || true
 ;;
 esac
 exit 0

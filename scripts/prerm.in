@@ -5,9 +5,9 @@ remove|purge)
 rm -f /var/mobile/ForceFastCharge/ffcharge.log 2>/dev/null || true
 rm -f /var/mobile/ForceFastCharge/status.plist 2>/dev/null || true
 rmdir /var/mobile/ForceFastCharge 2>/dev/null || true
-# 重启相关进程，摘除已注入的 tweak
+# 重启相关进程，摘除已注入的 tweak（SpringBoard 用 SIGTERM，避免 -9 致下次启动崩溃）
 killall -9 powerd 2>/dev/null || true
-killall -9 SpringBoard 2>/dev/null || true
+killall -10 SpringBoard 2>/dev/null || true
 ;;
 esac
 exit 0

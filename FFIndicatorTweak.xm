@@ -57,7 +57,7 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
                           CFNotificationName name, const void *object,
                           CFDictionaryRef userInfo) {
     (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
-    refreshIndicator(NO);
+    @try { refreshIndicator(NO); } @catch (NSException *e) {}
 }
 
 %ctor {
@@ -65,8 +65,11 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
         NSString *proc = [NSProcessInfo processInfo].processName;
         if (![proc isEqualToString:@"SpringBoard"]) return;
 
-        // 先按当前状态显示一次
-        refreshIndicator(YES);
+        // 首次刷新延后到主线程下一轮runloop：SpringBoard 启动瞬间 scene 尚未就绪，
+        // 此时建窗容易拿到无效 scene 导致崩溃黑屏。
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try { refreshIndicator(YES); } @catch (NSException *e) {}
+        });
 
         // 监听 powerd 的充电状态 / 开关变化通知
         CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
@@ -82,6 +85,8 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
         }
 
         // 2s 兜底轮询：覆盖通知丢失 / 状态文件写入竞态
+        // 注：refreshIndicator 只读偏好文件并把 UI 更新切到主线程，
+        //     跑在后台队列不会跨线程操作 UIKit。
         dispatch_source_t timer = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
@@ -90,7 +95,9 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
                                       dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                                       2 * NSEC_PER_SEC,
                                       300 * NSEC_PER_SEC / 1000);   // 300ms leeway
-            dispatch_source_set_event_handler(timer, ^{ refreshIndicator(NO); });
+            dispatch_source_set_event_handler(timer, ^{
+                @try { refreshIndicator(NO); } @catch (NSException *e) {}
+            });
             dispatch_resume(timer);
         }
     }
