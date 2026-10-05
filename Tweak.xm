@@ -37,7 +37,15 @@
 //   1. 只注入 powerd，不碰 thermalmonitord。生命周期 = powerd 生命周期，
 //      powerd 由 launchd 常驻，故装上即一直生效，无需自拉 daemon。
 //   2. 绝不伪造电池状态、绝不改写注册表读回值、**绝不主动写**任何电池属性。
-//      我们只做「拦截」——事件驱动，零轮询、零主动写盘（老板明确反对 heartbeat）。
+//      拦截逻辑本身是**纯事件驱动**：只在系统自己发起停充写的那一刻动手，
+//      零轮询写盘、不反复刷属性（老板明确反对 heartbeat 式功能实现）。
+//
+//      ⚠️ v0.2.1 例外（仅诊断，与功能无关）：加了一条 60s 心跳日志。
+//      起因是老板问「日志怎么一直不更新，是不是关了」—— 根因正是上面的
+//      "纯事件驱动"：不充电 / 没拦到东西时本来就不写日志，**静止是正确表现**，
+//      但静止无法区分「插件活着没事干」与「插件死了」。
+//      所以补一条 1 行/分钟的存活心跳 + 充电中的电池遥测，代价约 130KB/天
+//      （并有 512KB 轮转上限），功能逻辑仍不受任何影响。
 //   3. 覆盖三条写入通道：IORegistryEntrySetCFProperty（单数）、
 //      IORegistryEntrySetCFProperties（复数）、IOServiceSetCFProperty（若存在）。
 //      ⚠️ 复数版正是上游漏掉的那条 —— powerd 的 IOKit imports 里它是存在的。
@@ -73,6 +81,7 @@ static int gBlockedCount = 0;     // 累计拦下的停充写次数（历史总�
 static int gSessionBlocked = 0;   // **本次充电会话内**拦下的次数 —— 指示点红/绿的唯一判据
 static int gSetterCalls = 0;      // hook 被调用的总次数（诊断：证明 hook 点到底有没有被 powerd 用到）
 static BOOL gLastCharging = NO;   // 当前充电状态，供状态文件与指示器读取
+static uint64_t gTickCount = 0;   // 2s 轮询 tick 计数（v0.2.1：每 30 tick = 60s 发一次心跳）
 
 // ---------------------------------------------------------------- 诊断日志
 static NSString *diagLogPath(void) {
@@ -110,6 +119,73 @@ static void logThrottled(NSString *fmt, ...) {
     va_end(ap);
     logDiag(@"%@", body);
 }
+
+// ---------------------------------------------------------------- 电池遥测（纯只读）
+// v0.2.1：回答「系统到底在不在给电流」「它为什么停充」。
+// ⚠️ 全部只读 —— 绝不写任何属性，符合本插件「只拦不写」的铁律。
+// 字段含义（ChargerData 子字典）：
+//   ChargingCurrent             当前实际充电电流(mA)，0 = 真的没在充
+//   NotChargingReason           不充电原因：0=正常；128=未接充电器；
+//                               其余值=被系统/固件限制（温度、电量、策略…）
+//   TimeChargingThermallyLimited 因温控被限流的累计秒数（>0 即温控介入过）
+//   VacVoltageLimit / ChargingVoltage  充电器电压上限 / 实际充电电压(mV)
+static NSDictionary *readBatteryTelemetry(void) {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    @try {
+        mach_port_t mp = MACH_PORT_NULL;
+        if (IOMasterPort(MACH_PORT_NULL, &mp) != KERN_SUCCESS) return out;
+        io_service_t s = IOServiceGetMatchingService(mp, IOServiceMatching("IOPMPowerSource"));
+        if (!s) s = IOServiceGetMatchingService(mp, IOServiceMatching("AppleSmartBattery"));
+        if (!s) return out;
+        for (NSString *k in @[@"CurrentCapacity", @"Temperature",
+                              @"ExternalConnected", @"IsCharging", @"FullyCharged"]) {
+            CFTypeRef v = IORegistryEntryCreateCFProperty(s, (__bridge CFStringRef)k,
+                                                          kCFAllocatorDefault, 0);
+            if (v) out[k] = (__bridge_transfer id)v;   // transfer：交给 ARC 管理，不泄漏
+        }
+        CFTypeRef cd = IORegistryEntryCreateCFProperty(s, CFSTR("ChargerData"),
+                                                       kCFAllocatorDefault, 0);
+        if (cd) {
+            if (CFGetTypeID(cd) == CFDictionaryGetTypeID()) {
+                NSDictionary *d = (__bridge NSDictionary *)cd;
+                for (NSString *k in @[@"ChargingCurrent", @"ChargingVoltage",
+                                      @"VacVoltageLimit", @"NotChargingReason",
+                                      @"TimeChargingThermallyLimited"]) {
+                    if (d[k]) out[k] = d[k];
+                }
+            }
+            CFRelease(cd);
+        }
+        IOObjectRelease(s);
+    } @catch (NSException *e) {}
+    return out;
+}
+
+// 把遥测压成一行（日志/状态文件共用）
+static NSString *ffTelemetryLine(NSDictionary *t) {
+    return [NSString stringWithFormat:
+            @"cap=%@%% mA=%@ mV=%@ vac=%@ ncr=%@ thermal=%@ ext=%@ temp=%.1fC",
+            t[@"CurrentCapacity"] ?: @"?",
+            t[@"ChargingCurrent"] ?: @"?",
+            t[@"ChargingVoltage"] ?: @"?",
+            t[@"VacVoltageLimit"] ?: @"?",
+            t[@"NotChargingReason"] ?: @"?",
+            t[@"TimeChargingThermallyLimited"] ?: @"?",
+            t[@"ExternalConnected"] ?: @"?",
+            [t[@"Temperature"] doubleValue] / 100.0];   // IOKit 给的是 1/100 °C
+}
+
+// 日志体量上限：超 512KB 就删掉重来（心跳约 130KB/天 ⇒ 保留约 4 天）。
+// ⚠️ 只在心跳里调用，绝不在 hook 热路径上做 syscall。
+static void ffRotateLogIfTooBig(NSString *path) {
+    @try {
+        NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        if ([[a objectForKey:NSFileSize] unsignedLongLongValue] > 512ULL * 1024ULL) {
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        }
+    } @catch (NSException *e) {}
+}
+
 
 // ---------------------------------------------------------------- 开关读取
 // 注意：powerd 以 root 运行，用 CFPreferences 走 mobile 域会串域，
@@ -230,6 +306,17 @@ static void pollChargeState(void) {
         logDiag(@"charging session start -> sessionBlocked reset");
     }
     logDiag(@"charging state -> %@", charging ? @"YES" : @"NO");
+    if (!charging) {
+        // ⭐ v0.2.1 关键取证：系统**为什么**停充。
+        //   NotChargingReason: 0=正常、128=未接充电器、其余=被限（温度/电量/策略…）
+        //   TimeChargingThermallyLimited: 因温控被限流的累计秒数
+        //   分水岭判读：
+        //     · ncr 非 0/128 且 sessionBlocked==0 → 停充**不经过 powerd**
+        //       （内核 SMC 直控），我们拦不到 —— 这是"功能无效"，不是"没触发"。
+        //     · sessionBlocked>0 → 系统本来要停充，被我们挡住了（圆点该是红的）。
+        logDiag(@"charge stop reason: %@ sessionBlocked=%d",
+                ffTelemetryLine(readBatteryTelemetry()), gSessionBlocked);
+    }
     writeStatusFile();                       // 让指示器读到最新 charging
     notify_post(FFChargeStateNotifName.UTF8String);
 }
@@ -306,8 +393,21 @@ static IOServiceOpenFn                  orig_SvcOpen     = NULL;
 //   ① powerd 压根没调用这些 setter（hook 点不对）
 //   ② 调用了，但键名不在停充键表里（那就该扩表）
 // 打出「总调用数 + 出现过的键名（去重，上限 48 个）」就能一眼分辨。
-static void noteSetterCall(CFStringRef propertyName) {
+//
+// ⭐ v0.2.1 修正：停充键**永不被去重上限吃掉**。
+//   此前所有键共用 48 个名额，而 boot 期系统键就占了十几个；长期运行后名额
+//   可能被占满 → 真正想看的 ChargeInhibit / DisableInflow 一条都记不到（
+//   这恰好是"最关键的一条证据反而丢失"的坑）。现在停充键走独立分支，
+//   每次命中都记（含值 + 判定结果），完全不消耗去重名额。
+static void noteSetterCall(CFStringRef propertyName, CFTypeRef value) {
     gSetterCalls++;
+    if (isStopChargingKey(propertyName)) {
+        logDiag(@"stop-key seen: %@ = %@ (willBlock=%d)",
+                (__bridge NSString *)propertyName,
+                value ? (__bridge id)value : @"(nil)",
+                shouldBlockWrite(propertyName, value));
+        return;
+    }
     static NSMutableSet<NSString *> *seen = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
@@ -342,7 +442,7 @@ static void recordStopWrite(NSString *where, CFStringRef propertyName) {
 static kern_return_t hook_SetCFProperty(io_registry_entry_t entry,
                                         CFStringRef propertyName,
                                         CFTypeRef property) {
-    noteSetterCall(propertyName);
+    noteSetterCall(propertyName, property);
     if (shouldBlockWrite(propertyName, property)) {
         recordStopWrite(@"set", propertyName);
         return KERN_SUCCESS;   // 告诉系统「已处理」，实际不写入 → 系统没能断流
@@ -368,7 +468,7 @@ static kern_return_t hook_SetCFProperties(io_registry_entry_t entry, CFTypeRef p
             NSString *key = [k isKindOfClass:[NSString class]] ? (NSString *)k : [k description];
             if (!key.length) { kept[k] = dict[k]; continue; }
             CFStringRef kcf = (__bridge CFStringRef)key;
-            noteSetterCall(kcf);
+            noteSetterCall(kcf, (__bridge CFTypeRef)dict[k]);
             if (shouldBlockWrite(kcf, (__bridge CFTypeRef)dict[k])) {
                 blockedAny = YES;
                 recordStopWrite(@"setprops", kcf);
@@ -388,7 +488,7 @@ static kern_return_t hook_SetCFProperties(io_registry_entry_t entry, CFTypeRef p
 static kern_return_t hook_SvcSetCFProperty(io_service_t service,
                                            CFStringRef propertyName,
                                            CFTypeRef property) {
-    noteSetterCall(propertyName);
+    noteSetterCall(propertyName, property);
     if (shouldBlockWrite(propertyName, property)) {
         recordStopWrite(@"svc", propertyName);
         return KERN_SUCCESS;
@@ -453,6 +553,28 @@ static void installIOKitHooks(void) {
     }
     gHookInstalled = (orig_SetCFProp != NULL || orig_SetCFProps != NULL ||
                       orig_SvcSetCFProp != NULL);
+}
+
+// ---------------------------------------------------------------- 存活心跳（v0.2.1）
+// 老板问「日志怎么一直不更新，是不是关了」。根因是拦截逻辑纯事件驱动：
+// 不充电 / 没拦到东西时本来就不写日志，**静止是正确表现**。但"静止"无法区分
+// 「插件活着没事干」与「插件死了」，所以补一条 60s 心跳（每 30 个 2s tick 一次）：
+//   · 待机：一行 alive —— 证明 dylib 还在、hook 还挂着
+//   · 充电中：额外带电池遥测 —— 直接回答"系统到底有没有在给电流"
+// 代价：1 行/分钟 ≈ 130KB/天，且做了 512KB 轮转上限，可忽略。
+static void heartbeatTick(void) {
+    if (gTickCount % 30 != 0) return;          // 30 × 2s = 60s
+    ffRotateLogIfTooBig(diagLogPath());        // 顺带做日志体量治理（不在热路径）
+    if (gLastCharging) {
+        logDiag(@"heartbeat charging pid=%d hooks=%d force=%d %@ sessionBlocked=%d blocked=%d setterCalls=%d",
+                (int)getpid(), gHookInstalled, gForceFastCharge,
+                ffTelemetryLine(readBatteryTelemetry()),
+                gSessionBlocked, gBlockedCount, gSetterCalls);
+    } else {
+        logDiag(@"heartbeat idle pid=%d hooks=%d force=%d charging=0 sessionBlocked=%d blocked=%d setterCalls=%d",
+                (int)getpid(), gHookInstalled, gForceFastCharge,
+                gSessionBlocked, gBlockedCount, gSetterCalls);
+    }
 }
 
 // Darwin 通知回调（CFNotificationCenter 形态，对齐上游 SBCPUPowerd.xm 签名）
@@ -532,8 +654,10 @@ static void settingsChanged(CFNotificationCenterRef center, void *observer,
                                       300 * NSEC_PER_SEC / 1000);   // 300ms leeway
             dispatch_source_set_event_handler(timer, ^{
                 if (gHookInstalled) {
+                    gTickCount++;
                     updateChargeState();
                     pollChargeState();
+                    heartbeatTick();     // v0.2.1：60s 一次存活心跳（含充电遥测）
                 }
             });
             dispatch_resume(timer);

@@ -128,6 +128,46 @@
 
 安装/升级时由 `postinst` 自动清除日志，保证每次测试从干净状态开始；异常时 `touch /var/mobile/Documents/ForceFastCharge/disable` 可空跑止血。
 
+### 日志"不更新"是正常的 —— 请先读这一节
+
+拦截逻辑是**纯事件驱动**的：只有这些时刻才会写 `ffcharge.log` ——
+
+1. powerd 启动（`=== boot ... ===` / `hooks installed ...`）
+2. 开关变化（`forceCharge -> ON/OFF`）
+3. 充电状态翻转（`charging state -> YES/NO`，拔插充电器）
+4. **真的拦到系统停充**（`BLOCK stop-charge(set/setprops): ChargeInhibit`）
+5. 白名单键被写（`stop-key seen: ...`，无论拦没拦）
+6. 60 秒一次的存活心跳（v0.2.1 新增）
+
+所以**没插充电器、或系统安安静静正常充电时，日志就是静止的 —— 这不是坏了**。
+为了消除"静止 = 死了"的歧义，v0.2.1 加了心跳：
+
+```
+heartbeat idle pid=35209 hooks=1 force=1 charging=0 sessionBlocked=0 blocked=0 setterCalls=22
+heartbeat charging pid=35209 hooks=1 force=1 cap=92% mA=1224 mV=4371 vac=4360 ncr=0 thermal=0 ext=1 temp=34.7C sessionBlocked=0 blocked=0 setterCalls=31
+```
+
+- 待机：`heartbeat idle`（1 行/分钟）→ 看到它就说明 dylib 活着、hook 还挂着
+- 充电中：`heartbeat charging` + **电池遥测**，直接回答"系统到底有没有在给电流"
+- 日志超 512KB 自动轮转（约 4 天量），不会无限增长
+
+### 怎么读「系统为什么断流」
+
+拔线/断流那一刻会多打一行 `charge stop reason:`：
+
+```
+charge stop reason: cap=92% mA=0 mV=4371 vac=4360 ncr=132 thermal=0 ext=1 temp=41.2C sessionBlocked=0
+```
+
+判读（这是"功能无效"与"没触发"的分水岭）：
+
+| 观察 | 结论 |
+|---|---|
+| `ncr=0` / `ncr=128` | 正常（128 = 没接充电器），系统没在限你 |
+| `ncr` 是别的值（如 132）且 `sessionBlocked=0` | 停充**不经过 powerd**（内核 SMC / 固件直控），我们拦不到 → 圆点不会红 |
+| `sessionBlocked>0` 或日志里有 `BLOCK stop-charge` | 系统本来要停充，**被我们拦住了** → 圆点该是红的 |
+| `thermal>0` | 温控介入过（累计秒数），说明是温度触发的限流 |
+
 ## 构建
 
 - rootless：`make package`

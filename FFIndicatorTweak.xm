@@ -4,7 +4,7 @@
 //  只注入 SpringBoard，负责：
 //   1. 读偏好（开关/显示模式/坐标）+ 自读 IORegistry 充电状态 → 驱动圆点；
 //   2. 监听 powerd 侧 Darwin 通知即时刷新；
-//   3. 2s 兜底轮询；
+//   3. 2s 兜底轮询（v0.2.1 起顺带每 60s 发一次存活心跳，避免日志静止被误判为"插件死了"）；
 //   4. 把运行状态写 sb_status.plist，供设置页确认「指示器到底跑没跑」。
 //
 //  ⚠️ v0.1.2 关键修复（实机踩坑）：
@@ -32,6 +32,7 @@ static BOOL gLastActive   = NO;   // 上一轮「我们有没有拦下系统停�
 static NSInteger gLastMode = -1;
 static CGFloat gLastX = -1, gLastY = -1;   // 坐标也要纳入变化检测，否则改坐标不生效
 static BOOL gEnabled      = NO;   // 是否成功进入运行态
+static uint64_t gTick      = 0;   // 2s tick 计数（v0.2.1：每 30 tick = 60s 一次心跳）
 
 // ---------------------------------------------------------------- 诊断日志
 // SpringBoard 侧此前完全没有日志，出问题只能盲猜，这里补全。
@@ -53,6 +54,17 @@ static void sbLog(NSString *fmt, ...) {
     const char *cs = line.UTF8String;
     if (cs) (void)write(fd, cs, strlen(cs));
     close(fd);
+}
+
+// 日志体量上限（同 powerd 侧）：只在心跳里检查，热路径零开销
+static void sbRotateIfTooBig(void) {
+    @try {
+        NSString *p = @"/var/mobile/Documents/ForceFastCharge/sb.log";
+        NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+        if ([[a objectForKey:NSFileSize] unsignedLongLongValue] > 512ULL * 1024ULL) {
+            [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+        }
+    } @catch (NSException *e) {}
 }
 
 // ---------------------------------------------------------------- 偏好读取
@@ -274,7 +286,18 @@ static void stateChanged(CFNotificationCenterRef center, void *observer,
                                       2 * NSEC_PER_SEC,
                                       300 * NSEC_PER_SEC / 1000);   // 300ms leeway
             dispatch_source_set_event_handler(timer, ^{
-                @try { refreshIndicator(NO); } @catch (NSException *e) {}
+                @try {
+                    // v0.2.1：60s 存活心跳。refreshIndicator 在"无变化"时是不写日志的
+                    // （纯事件驱动），日志静止会让人以为插件死了 —— 心跳解决这个歧义。
+                    gTick++;
+                    if (gTick % 30 == 0) {
+                        sbRotateIfTooBig();
+                        sbLog(@"heartbeat pid=%d win=%d force=%d charging=%d active=%d mode=%ld",
+                              (int)getpid(), [FFIndicator windowCreated], gLastForce,
+                              gLastCharging, gLastActive, (long)gLastMode);
+                    }
+                    refreshIndicator(NO);
+                } @catch (NSException *e) {}
             });
             dispatch_resume(timer);
         }
